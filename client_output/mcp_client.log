@@ -1,0 +1,24 @@
+2025-09-11 04:52:17,281 - __main__ - INFO - Gemini API configured with model: gemini-2.5-flash
+2025-09-11 04:52:17,282 - __main__ - INFO - Connecting to MCP server: D:\Project-1\mcp_server.py
+2025-09-11 04:52:17,288 - __main__ - INFO - MCP server process started successfully
+2025-09-11 04:52:19,021 - __main__ - ERROR - Server initialization error: No response from server - connection may be closed
+2025-09-11 04:52:19,021 - __main__ - ERROR - Failed to connect to MCP server: Failed to initialize MCP server
+2025-09-11 04:52:19,022 - __main__ - INFO - Disconnected from MCP server
+2025-09-11 04:52:19,022 - __main__ - ERROR - Failed to initialize MCP Manager: Failed to initialize MCP server
+2025-09-11 04:52:19,022 - __main__ - ERROR - Main execution error: Failed to initialize MCP server
+2025-09-11 04:54:23,806 - __main__ - INFO - Gemini API configured with model: gemini-2.5-flash
+2025-09-11 04:54:23,806 - __main__ - INFO - Connecting to MCP server: D:\Project-1\mcp_server.py
+2025-09-11 04:54:23,813 - __main__ - INFO - MCP server process started successfully
+2025-09-11 04:54:25,249 - __main__ - ERROR - Server initialization error: No response from server - connection may be closed
+2025-09-11 04:54:25,250 - __main__ - ERROR - Failed to connect to MCP server: Failed to initialize MCP server
+2025-09-11 04:54:25,250 - __main__ - INFO - Disconnected from MCP server
+2025-09-11 04:54:25,250 - __main__ - ERROR - Failed to initialize MCP Manager: Failed to initialize MCP server
+2025-09-11 04:54:25,251 - __main__ - ERROR - Main execution error: Failed to initialize MCP server
+2025-09-11 04:56:39,897 - __main__ - INFO - Gemini API configured with model: gemini-2.5-flash
+2025-09-11 04:56:39,898 - __main__ - INFO - Connecting to MCP server: D:\Project-1\mcp_server.py
+2025-09-11 04:56:39,904 - __main__ - INFO - MCP server process started successfully
+2025-09-11 04:56:41,405 - __main__ - INFO - Loaded 7 tools
+2025-09-11 04:56:41,406 - __main__ - INFO - Successfully connected - 7 tools available
+2025-09-11 04:56:41,406 - __main__ - INFO - MCP Manager successfully initialized
+2025-09-11 04:56:41,408 - __main__ - INFO - Disconnected from MCP server
+2025-09-11 04:56:41,408 - __main__ - ERROR - Main execution error: 'ConversationalMCPManager' object has no attribute 'start_interactive_session'
