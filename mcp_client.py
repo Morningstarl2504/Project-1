@@ -1,8 +1,8 @@
-#mcp_client1.py
+#mcp_client.py
 #!/usr/bin/env python3
 """
 Enhanced NLP MCP Client with Conversational Interface
-Fixed MCP library usage and continuous conversational capability
+(*** FINAL STABLE VERSION ***)
 """
 
 import asyncio
@@ -24,8 +24,10 @@ load_dotenv()
 class Config:
     def __init__(self):
         self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-        self.GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
-        self.MCP_SERVER_SCRIPT = os.getenv('MCP_SERVER_SCRIPT', 'mcp_server.py')
+        self.GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+        
+        self.MCP_SERVER_SCRIPT = os.getenv('MCP_SERVER_SCRIPT', 'mcp_server.py') 
+        
         self.MCP_SERVER_TIMEOUT = int(os.getenv('MCP_SERVER_TIMEOUT', '30'))
         self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
         self.OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', './client_output'))
@@ -40,10 +42,13 @@ class Config:
         
         # Validate required settings
         if not self.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY not found in environment variables")
+            raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
         
         if not Path(self.MCP_SERVER_SCRIPT).exists():
-            raise FileNotFoundError(f"MCP server script not found: {self.MCP_SERVER_SCRIPT}")
+            script_dir = Path(__file__).parent
+            if not (script_dir / self.MCP_SERVER_SCRIPT).exists():
+                raise FileNotFoundError(f"MCP server script not found: {self.MCP_SERVER_SCRIPT}")
+            self.MCP_SERVER_SCRIPT = str(script_dir / self.MCP_SERVER_SCRIPT)
 
 config = Config()
 
@@ -412,7 +417,7 @@ class SimpleMCPClient:
             
             if response.get("error"):
                 return {
-                    "success": False,
+                    "success": False, # Client-side success
                     "error": response["error"].get("message", "Unknown error"),
                     "tool_name": tool_name
                 }
@@ -423,22 +428,24 @@ class SimpleMCPClient:
             if content and len(content) > 0:
                 content_text = content[0].get("text", "")
                 try:
+                    # The server now returns valid JSON
                     parsed_result = json.loads(content_text)
                     return {
-                        "success": True,
-                        "result": parsed_result,
+                        "success": True, # Client-side success
+                        "result": parsed_result, # Server-side result
                         "tool_name": tool_name
                     }
                 except json.JSONDecodeError:
+                    # Fallback if server returns plain text
                     return {
                         "success": True,
-                        "result": {"text": content_text},
+                        "result": {"success": True, "text": content_text},
                         "tool_name": tool_name
                     }
             
             return {
                 "success": True,
-                "result": {"message": "Tool executed successfully"},
+                "result": {"success": True, "message": "Tool executed successfully (No content)"},
                 "tool_name": tool_name
             }
             
@@ -466,7 +473,9 @@ class SimpleMCPClient:
         
         line = await self.process.stdout.readline()
         if not line:
-            raise Exception("No response from server")
+            stderr_data = await asyncio.wait_for(self.process.stderr.read(1024), timeout=1.0)
+            logger.error(f"No response from server. STDERR: {stderr_data.decode()}")
+            raise Exception("No response from server - connection may be closed")
         
         return json.loads(line.decode().strip())
 
@@ -539,14 +548,20 @@ class ConversationalMCPClient:
                 tool_name = step.get("tool_name")
                 parameters = step.get("parameters", {})
                 
-                # Check if we need user input
-                if step.get("requires_user_input", False):
-                    input_needed = step.get("input_needed", [])
-                    return f"I can help with that! I need the following information to proceed:\n" + "\n".join(f"- {item}" for item in input_needed)
-                
-                # Replace placeholders if possible
+                # Replace placeholders with full paths
                 parameters = self._resolve_placeholders(parameters, user_input)
                 
+                # Check if we still need user input (e.g., file path was missing)
+                if step.get("requires_user_input", False):
+                    has_placeholders = False
+                    for key, value in parameters.items():
+                         if isinstance(value, str) and ("USER_FILE_PATH" in value or "placeholder" in value.lower()):
+                            has_placeholders = True
+                            break
+                    if has_placeholders:
+                        input_needed = step.get("input_needed", ["a file path"])
+                        return f"I can help with that! I need the following information to proceed:\n" + "\n".join(f"- {item}" for item in input_needed)
+
                 # Execute the tool
                 result = await self.mcp_client.execute_tool(tool_name, parameters)
                 execution_results.append(result)
@@ -562,61 +577,75 @@ class ConversationalMCPClient:
         """Resolve placeholder values in parameters"""
         resolved = parameters.copy()
         
-        # Extract potential file paths
+        # This regex finds full paths, quoted or not
+        # It looks for D:\... or C:\... paths
         file_patterns = [
-            r'["\']([^"\']+\.[a-zA-Z0-9]{2,5})["\']',
-            r'(\b\w+\.[a-zA-Z0-9]{2,5})\b'
+            r'["\'](C:\\[^"\']+?\.[a-zA-Z0-9]{3,5}|D:\\[^"\']+?\.[a-zA-Z0-9]{3,5})["\']', # Quoted full paths
+            r'\b(C:\\[^\s]+?\.[a-zA-Z0-9]{3,5}|D:\\[^\s]+?\.[a-zA-Z0-9]{3,5})\b' # Unquoted full paths
         ]
         
         extracted_files = []
         for pattern in file_patterns:
-            matches = re.findall(pattern, user_input)
+            matches = re.findall(pattern, user_input, re.IGNORECASE)
             extracted_files.extend(matches)
         
         # Replace placeholders
         for key, value in parameters.items():
             if isinstance(value, str) and ("USER_FILE_PATH" in value or "placeholder" in value.lower()):
                 if extracted_files:
+                    # <<< FIX: Use the FULL extracted path >>>
                     resolved[key] = extracted_files[0]
                 else:
-                    # Keep placeholder, will be handled by requiring user input
-                    pass
+                    pass # Keep placeholder
         
         return resolved
     
     def _format_execution_response(self, execution_results: List[Dict], execution_plan: Dict) -> str:
         """Format response based on execution results"""
-        successful_executions = [r for r in execution_results if r.get("success")]
-        failed_executions = [r for r in execution_results if not r.get("success")]
         
         response_parts = []
         
+        # Check for raw failures from the client's execute_tool call
+        raw_failures = [r for r in execution_results if not r.get("success")]
+        if raw_failures:
+            response_parts.append(f"✗ {len(raw_failures)} operation(s) failed:")
+            for res in raw_failures:
+                tool_name = res.get("tool_name", "Unknown tool")
+                error = res.get("error", "Unknown error")
+                response_parts.append(f"- {tool_name}: {error}")
+            return "\n".join(response_parts)
+
+        # Process results *from the server's JSON payload*
+        successful_executions = [r for r in execution_results if r.get("result", {}).get("success")]
+        server_failures = [r for r in execution_results if not r.get("result", {}).get("success")]
+
         if successful_executions:
             response_parts.append(f"✓ Successfully executed {len(successful_executions)} operation(s)!")
-            
-            for result in successful_executions:
-                tool_name = result.get("tool_name", "Unknown tool")
-                response_parts.append(f"- {tool_name}: Completed successfully")
+            for res in successful_executions:
+                tool_name = res.get("tool_name", "Unknown tool")
+                result_data = res.get("result", {})
                 
-                # Include relevant result information
-                if result.get("result") and isinstance(result["result"], dict):
-                    if "output_path" in result["result"]:
-                        response_parts.append(f"  Output saved to: {result['result']['output_path']}")
-                    elif "message" in result["result"]:
-                        response_parts.append(f"  {result['result']['message']}")
+                # <<< FIX: Use the REAL message from the server >>>
+                message = result_data.get("message", "Completed successfully")
+                response_parts.append(f"- {tool_name}: {message}")
+
+                if "output_path" in result_data:
+                    response_parts.append(f"  Output saved to: {result_data['output_path']}")
         
-        if failed_executions:
-            response_parts.append(f"\n✗ {len(failed_executions)} operation(s) failed:")
-            for result in failed_executions:
-                tool_name = result.get("tool_name", "Unknown tool")
-                error = result.get("error", "Unknown error")
+        if server_failures:
+            response_parts.append(f"\n✗ {len(server_failures)} operation(s) failed:")
+            for res in server_failures:
+                tool_name = res.get("tool_name", "Unknown tool")
+                result_data = res.get("result", {})
+                # <<< FIX: Use the REAL error from the server >>>
+                error = result_data.get("error", "Unknown error from server")
                 response_parts.append(f"- {tool_name}: {error}")
         
-        expected_outcome = execution_plan.get("expected_outcome", "")
-        if expected_outcome and successful_executions:
-            response_parts.append(f"\n{expected_outcome}")
-        
-        return "\n".join(response_parts) if response_parts else "Operation completed."
+        # Fallback if no parts were generated
+        if not response_parts:
+             return "Operation completed, but the server sent an unrecognized response."
+
+        return "\n".join(response_parts)
     
     async def start_interactive_session(self):
         """Start the interactive conversational session"""
@@ -626,12 +655,15 @@ class ConversationalMCPClient:
         print(f"Connected to: {config.MCP_SERVER_SCRIPT}")
         print(f"Available tools: {len(self.mcp_client.available_tools)}")
         print(f"AI Model: {config.GEMINI_MODEL}")
+        
+        # <<< UPDATED MENU >>>
         print("\nI can help you with:")
-        print("• Document conversion (PDF, DOCX, HTML, Markdown, etc.)")
-        print("• Image processing (resize, enhance, format conversion)")
-        print("• Email analysis and search")
-        print("• News monitoring and trending topics")
+        print("• Document Conversion (DOCX, PPTX, PDF, HTML, TXT, etc.)")
+        print("• Image Processing (resize, enhance, format conversion)")
+        print("• Email Archive Analysis (search, top contacts)")
+        print("• News Monitoring (add RSS feeds, get trending topics)")
         print("• General questions and conversation")
+        
         print("\nJust tell me what you need in natural language!")
         print("Type 'quit' to exit.")
         print("=" * 70)
@@ -683,7 +715,7 @@ async def main():
                 
     except Exception as e:
         print(f"❌ Error: {e}")
-        logger.error(f"Main error: {e}")
+        logger.error(f"Main error: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":

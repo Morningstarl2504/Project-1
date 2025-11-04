@@ -12,6 +12,9 @@ PyPDF2>=3.0.0
 beautifulsoup4>=4.11.0
 markdown>=3.4.0
 
+# <<< RELIABLE CONVERSION (Windows Only) >>>
+pywin32
+
 # Email processing
 # (built-in email and mailbox modules)
 
@@ -21,19 +24,4 @@ requests>=2.28.0
 
 # File type detection
 python-magic-bin
-
-# Optional: Enhanced PDF processing
-# pdfplumber>=0.9.0
-# PyMuPDF>=1.21.0
-
-# Optional: Enhanced document processing  
-# mammoth>=1.5.0
-# python-pptx>=0.6.21
-
-# Optional: Enhanced image processing
-# opencv-python>=4.7.0
-# scikit-image>=0.20.0
-
-# Development and testing
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
+python-dotenv>=1.0.0

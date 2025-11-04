@@ -4,6 +4,7 @@
 """
 Complete MCP Server for Content & Media Processing
 Standalone implementation with all services integrated
+(*** FINAL STABLE VERSION ***)
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from datetime import datetime
 import tempfile
 import shutil
 import uuid
+import sqlite3
 
 # Core MCP imports
 from mcp.server import Server
@@ -39,12 +41,17 @@ from email.policy import default
 import re
 import magic
 
+# <<< LIBRARIES FOR RELIABLE CONVERSION >>>
+import pythoncom
+import win32com.client
+
 # Configuration
 class Config:
     BASE_DIR = Path(__file__).parent
     TEMP_DIR = BASE_DIR / "temp"
     OUTPUT_DIR = BASE_DIR / "output" 
     CACHE_DIR = BASE_DIR / "cache"
+    DB_PATH = BASE_DIR / "mcp_server.db"
     
     # File size limits (in bytes)
     MAX_DOC_SIZE = 50 * 1024 * 1024  # 50MB
@@ -52,7 +59,7 @@ class Config:
     MAX_EMAIL_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
     
     # Supported formats
-    DOC_FORMATS = ["pdf", "docx", "doc", "html", "htm", "md", "markdown", "txt", "rtf"]
+    DOC_FORMATS = ["pdf", "docx", "doc", "html", "htm", "md", "markdown", "txt", "rtf", "pptx"]
     IMG_FORMATS = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"]
     EMAIL_FORMATS = ["mbox", "eml"]
     
@@ -70,7 +77,28 @@ logger = logging.getLogger(__name__)
 # Initialize MCP Server
 app = Server("content-media-hub")
 
-# Utility Functions
+# --- Database Utility Functions ---
+def get_db_connection():
+    """Create a database connection"""
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def log_to_history(tool_name: str, status: str, source_path: str = None, output_path: str = None, error_message: str = None, metadata: dict = None):
+    """Log an action to the processing_history table"""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO processing_history (tool_name, source_path, output_path, status, error_message, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (tool_name, source_path, output_path, status, error_message, json.dumps(metadata) if metadata else None)
+            )
+    except Exception as e:
+        logger.error(f"Failed to log to database: {e}")
+
+# --- Utility Functions ---
 def ensure_directory(path: Path):
     """Ensure directory exists"""
     path.mkdir(parents=True, exist_ok=True)
@@ -92,8 +120,10 @@ def detect_file_format(filepath: Path) -> str:
         mime_type = magic.from_file(str(filepath), mime=True)
         if 'pdf' in mime_type:
             return 'pdf'
-        elif 'word' in mime_type or 'officedocument' in mime_type:
+        elif 'word' in mime_type or 'officedocument.wordprocessingml' in mime_type:
             return 'docx' if 'openxml' in mime_type else 'doc'
+        elif 'powerpoint' in mime_type or 'officedocument.presentationml' in mime_type:
+            return 'pptx'
         elif 'html' in mime_type:
             return 'html'
         elif 'image' in mime_type:
@@ -102,7 +132,7 @@ def detect_file_format(filepath: Path) -> str:
         pass
     return ext if ext in config.DOC_FORMATS + config.IMG_FORMATS else 'txt'
 
-# Document Processing Service
+# --- Document Processing Service ---
 class DocumentProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "documents"
@@ -111,21 +141,36 @@ class DocumentProcessor:
     async def convert_document(self, source_path: str, target_format: str, **kwargs) -> Dict[str, Any]:
         """Convert document between formats"""
         try:
+            # Use Path() to handle file paths correctly
             source = Path(source_path)
             if not source.exists():
-                raise FileNotFoundError(f"Source file not found: {source_path}")
-            
+                # Try to find the file in the base directory if a full path fails
+                source = config.BASE_DIR / source.name
+                if not source.exists():
+                    raise FileNotFoundError(f"Source file not found: {source_path}")
+
             validate_file_size(source, config.MAX_DOC_SIZE)
             source_format = detect_file_format(source)
-            
+
             # Generate output path
             output_name = f"{source.stem}.{target_format}"
             output_path = self.output_dir / output_name
-            
+
             # Perform conversion
             if source_format == target_format:
                 shutil.copy2(source, output_path)
                 message = "File copied (same format)"
+
+            elif (source_format == 'docx' or source_format == 'doc') and target_format == 'pdf':
+                await self._com_convert_to_pdf(source, output_path, "Word.Application", "Documents", 17)
+                await asyncio.sleep(1.5) # Wait for file lock
+                message = "Converted Document to PDF using Word"
+            
+            elif (source_format == 'pptx' or source_format == 'ppt') and target_format == 'pdf':
+                await self._com_convert_to_pdf(source, output_path, "PowerPoint.Application", "Presentations", 32)
+                await asyncio.sleep(1.5) # Wait for file lock
+                message = "Converted Presentation to PDF using PowerPoint"
+
             elif self._can_use_pandoc(source_format, target_format):
                 await self._pandoc_convert(source, output_path, source_format, target_format)
                 message = "Converted using Pandoc"
@@ -136,17 +181,11 @@ class DocumentProcessor:
                 await self._docx_to_text(source, output_path)
                 message = "Converted DOCX to text"
             else:
-                # Chain conversion through HTML
-                temp_html = config.TEMP_DIR / f"temp_{uuid.uuid4().hex}.html"
-                await self._to_html(source, temp_html, source_format)
-                await self._from_html(temp_html, output_path, target_format)
-                temp_html.unlink(missing_ok=True)
-                message = "Converted via HTML intermediary"
-            
-            # Get metadata
+                raise ValueError(f"Unsupported conversion: from '{source_format}' to '{target_format}'")
+
             metadata = await self._get_document_metadata(output_path)
-            
-            return {
+
+            result = {
                 "success": True,
                 "message": message,
                 "output_path": str(output_path),
@@ -155,29 +194,41 @@ class DocumentProcessor:
                 "file_size": output_path.stat().st_size,
                 "metadata": metadata
             }
-            
+            log_to_history("convert_document", "success", str(source), str(output_path), metadata=result)
+            return result
+
         except Exception as e:
-            logger.error(f"Document conversion failed: {e}")
+            logger.exception(f"Document conversion failed")
+            log_to_history("convert_document", "error", str(source_path), error_message=str(e))
             return {
                 "success": False,
                 "error": str(e),
-                "source_path": source_path,
+                "source_path": str(source_path),
                 "target_format": target_format
             }
     
     def _can_use_pandoc(self, source_format: str, target_format: str) -> bool:
         """Check if pandoc can handle conversion"""
-        pandoc_formats = {'md', 'markdown', 'html', 'htm', 'docx', 'txt', 'rtf'}
-        return source_format in pandoc_formats and target_format in pandoc_formats
+        pandoc_sources = {'md', 'markdown', 'html', 'htm', 'docx', 'txt', 'rtf'}
+        pandoc_targets = {'md', 'markdown', 'html', 'htm', 'docx', 'txt', 'rtf', 'pdf'} 
+        return source_format in pandoc_sources and target_format in pandoc_targets
     
     async def _pandoc_convert(self, source: Path, output: Path, source_fmt: str, target_fmt: str):
         """Convert using pandoc"""
         try:
+            extra_args = []
+            if target_fmt == 'html':
+                extra_args = ['--standalone']
+            elif target_fmt == 'pdf':
+                extra_args = ['--pdf-engine=wkhtmltopdf']
+
             pypandoc.convert_file(
                 str(source), target_fmt, outputfile=str(output),
-                extra_args=['--standalone'] if target_fmt == 'html' else []
+                extra_args=extra_args
             )
         except Exception as e:
+            if 'wkhtmltopdf' in str(e):
+                raise RuntimeError("Pandoc conversion failed: PDF engine 'wkhtmltopdf' not found. Please install it to convert to PDF.")
             raise RuntimeError(f"Pandoc conversion failed: {e}")
     
     async def _pdf_to_text(self, source: Path, output: Path):
@@ -239,8 +290,40 @@ class DocumentProcessor:
             "modified": datetime.fromtimestamp(stats.st_mtime).isoformat(),
             "format": detect_file_format(filepath)
         }
+        
+    async def _com_convert_to_pdf(self, source: Path, output: Path, app_name: str, collection_name: str, pdf_format_type: int):
+        """Generic COM converter for Word and PowerPoint"""
+        
+        def com_task():
+            pythoncom.CoInitialize()
+            app = None
+            doc = None
+            try:
+                src_abs = str(source.resolve())
+                out_abs = str(output.resolve())
+                
+                app = win32com.client.Dispatch(app_name)
+                collection = getattr(app, collection_name)
+                doc = collection.Open(src_abs, WithWindow=False)
+                
+                doc.SaveAs(out_abs, pdf_format_type) # 17 for Word, 32 for PowerPoint
+                
+            except Exception as e:
+                raise RuntimeError(f"{app_name} (COM) conversion failed: {e}. Do you have Microsoft Office installed?")
+            finally:
+                if doc:
+                    doc.Close()
+                if app:
+                    app.Quit()
+                pythoncom.CoUninitialize()
 
-# Image Processing Service
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, com_task)
+        except Exception as e:
+            raise RuntimeError(f"COM conversion failed: {e}")
+
+# --- Image Processing Service ---
 class ImageProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "images"
@@ -251,7 +334,9 @@ class ImageProcessor:
         try:
             source = Path(image_path)
             if not source.exists():
-                raise FileNotFoundError(f"Image file not found: {image_path}")
+                source = config.BASE_DIR / source.name
+                if not source.exists():
+                    raise FileNotFoundError(f"Source file not found: {image_path}")
             
             validate_file_size(source, config.MAX_IMG_SIZE)
             
@@ -293,10 +378,9 @@ class ImageProcessor:
                 
                 processed_img.save(output_path, **save_kwargs)
             
-            # Get metadata
             metadata = await self._get_image_metadata(output_path)
             
-            return {
+            result = {
                 "success": True,
                 "message": f"Image processed with {len(operations)} operations",
                 "output_path": str(output_path),
@@ -304,9 +388,12 @@ class ImageProcessor:
                 "output_format": output_format,
                 "metadata": metadata
             }
+            log_to_history("process_image", "success", str(source), str(output_path), metadata=result)
+            return result
             
         except Exception as e:
-            logger.error(f"Image processing failed: {e}")
+            logger.exception(f"Image processing failed")
+            log_to_history("process_image", "error", str(image_path), error_message=str(e))
             return {
                 "success": False,
                 "error": str(e),
@@ -334,14 +421,10 @@ class ImageProcessor:
     
     def _enhance_image(self, img: Image.Image) -> Image.Image:
         """Apply basic image enhancements"""
-        # Enhance contrast
         enhancer = ImageEnhance.Contrast(img)
         img = enhancer.enhance(1.1)
-        
-        # Enhance sharpness
         enhancer = ImageEnhance.Sharpness(img)
         img = enhancer.enhance(1.1)
-        
         return img
     
     async def _get_image_metadata(self, filepath: Path) -> Dict[str, Any]:
@@ -361,7 +444,7 @@ class ImageProcessor:
             stats = filepath.stat()
             return {"file_size": stats.st_size, "format": "unknown"}
 
-# Email Processing Service
+# --- Email Processing Service ---
 class EmailProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "email"
@@ -372,14 +455,13 @@ class EmailProcessor:
         try:
             archive = Path(archive_path)
             if not archive.exists():
-                raise FileNotFoundError(f"Email archive not found: {archive_path}")
+                archive = config.BASE_DIR / archive.name
+                if not archive.exists():
+                    raise FileNotFoundError(f"Email archive not found: {archive_path}")
             
             validate_file_size(archive, config.MAX_EMAIL_SIZE)
-            
-            # Parse emails
             emails = await self._parse_email_archive(archive)
             
-            # Search emails
             query_lower = query.lower()
             matching_emails = []
             
@@ -392,7 +474,7 @@ class EmailProcessor:
                         "snippet": email_data.get("content", "")[:200] + "..."
                     })
             
-            return {
+            result = {
                 "success": True,
                 "message": f"Found {len(matching_emails)} matching emails",
                 "total_emails": len(emails),
@@ -400,9 +482,12 @@ class EmailProcessor:
                 "results": matching_emails[:50],  # Limit results
                 "query": query
             }
+            log_to_history("search_emails", "success", str(archive), metadata={"query": query, "matches": len(matching_emails)})
+            return result
             
         except Exception as e:
-            logger.error(f"Email search failed: {e}")
+            logger.exception(f"Email search failed")
+            log_to_history("search_emails", "error", str(archive_path), error_message=str(e), metadata={"query": query})
             return {
                 "success": False,
                 "error": str(e),
@@ -414,16 +499,19 @@ class EmailProcessor:
         """Analyze communication patterns"""
         try:
             archive = Path(archive_path)
+            if not archive.exists():
+                archive = config.BASE_DIR / archive.name
+                if not archive.exists():
+                    raise FileNotFoundError(f"Email archive not found: {archive_path}")
+
             emails = await self._parse_email_archive(archive)
             
             if not emails:
                 raise ValueError("No emails found in archive")
             
-            # Analyze patterns
             sent_count = sum(1 for e in emails if self._is_sent_email(e))
             received_count = len(emails) - sent_count
             
-            # Contact analysis
             contacts = {}
             for email_data in emails:
                 sender = email_data.get("sender", "")
@@ -432,15 +520,13 @@ class EmailProcessor:
                 
                 contacts[sender]["count"] += 1
                 date_str = email_data.get("date", "")
-                # Simplified date handling
                 contacts[sender]["last_contact"] = date_str
                 if not contacts[sender]["first_contact"]:
                     contacts[sender]["first_contact"] = date_str
             
-            # Top contacts
             top_contacts = sorted(contacts.items(), key=lambda x: x[1]["count"], reverse=True)[:10]
             
-            return {
+            result = {
                 "success": True,
                 "message": f"Analyzed {len(emails)} emails",
                 "total_emails": len(emails),
@@ -450,9 +536,12 @@ class EmailProcessor:
                 "top_contacts": [{"email": email, **data} for email, data in top_contacts],
                 "analysis_date": datetime.now().isoformat()
             }
+            log_to_history("analyze_communication_patterns", "success", str(archive), metadata={"total_emails": len(emails)})
+            return result
             
         except Exception as e:
-            logger.error(f"Communication analysis failed: {e}")
+            logger.exception(f"Communication analysis failed")
+            log_to_history("analyze_communication_patterns", "error", str(archive_path), error_message=str(e))
             return {
                 "success": False,
                 "error": str(e),
@@ -462,7 +551,6 @@ class EmailProcessor:
     async def _parse_email_archive(self, archive_path: Path) -> List[Dict[str, Any]]:
         """Parse email archive file"""
         emails = []
-        
         try:
             if archive_path.suffix.lower() == '.mbox':
                 mbox = mailbox.mbox(str(archive_path))
@@ -478,7 +566,6 @@ class EmailProcessor:
                         emails.append(email_data)
         except Exception as e:
             logger.warning(f"Failed to parse email archive: {e}")
-        
         return emails
     
     def _parse_email_message(self, message) -> Optional[Dict[str, Any]]:
@@ -514,50 +601,57 @@ class EmailProcessor:
             email_data.get("sender", ""),
             email_data.get("content", "")
         ]).lower()
-        
         return query in searchable_text
     
     def _is_sent_email(self, email_data: Dict[str, Any]) -> bool:
         """Simple heuristic to determine if email was sent"""
         sender = email_data.get("sender", "").lower()
-        # This is a simplified check - in reality, you'd compare against user's email addresses
         return "noreply" not in sender and "no-reply" not in sender
 
-# News Processing Service
+# --- News Processing Service ---
 class NewsProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "news"
         ensure_directory(self.output_dir)
-        self.cache = {}
     
     async def add_news_source(self, feed_url: str, category: str = "general", **kwargs) -> Dict[str, Any]:
-        """Add RSS news source"""
+        """Add RSS news source to the database"""
         try:
-            # Validate feed
             feed = feedparser.parse(feed_url)
             if feed.bozo:
-                raise ValueError("Invalid RSS feed")
+                raise ValueError(f"Invalid RSS feed: {feed_url}")
             
             source_data = {
                 "url": feed_url,
                 "title": feed.feed.get("title", "Unknown"),
                 "description": feed.feed.get("description", ""),
                 "category": category,
-                "last_updated": datetime.now().isoformat(),
-                "total_entries": len(feed.entries)
             }
             
-            # Cache the source
-            self.cache[feed_url] = source_data
+            with get_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO news_sources (url, title, description, category, last_updated)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title=excluded.title,
+                        description=excluded.description,
+                        category=excluded.category,
+                        last_updated=excluded.last_updated
+                    """,
+                    (source_data["url"], source_data["title"], source_data["description"], source_data["category"], datetime.now().isoformat())
+                )
             
+            log_to_history("add_news_source", "success", feed_url, metadata=source_data)
             return {
                 "success": True,
-                "message": f"Added news source: {source_data['title']}",
+                "message": f"Added/Updated news source: {source_data['title']}",
                 "source_data": source_data
             }
             
         except Exception as e:
-            logger.error(f"Failed to add news source: {e}")
+            logger.exception(f"Failed to add news source")
+            log_to_history("add_news_source", "error", feed_url, error_message=str(e))
             return {
                 "success": False,
                 "error": str(e),
@@ -565,48 +659,82 @@ class NewsProcessor:
             }
     
     async def get_trending_topics(self, time_window: str = "24h", **kwargs) -> Dict[str, Any]:
-        """Get trending topics from cached sources"""
+        """Get trending topics from database sources"""
+        all_articles = []
+        source_count = 0
+        
         try:
-            all_articles = []
+            with get_db_connection() as conn:
+                sources = conn.execute("SELECT id, url, title FROM news_sources WHERE status='active'").fetchall()
+                source_count = len(sources)
             
-            # Collect articles from all cached sources
-            for source_url, source_data in self.cache.items():
-                try:
-                    feed = feedparser.parse(source_url)
-                    for entry in feed.entries[:10]:  # Limit per source
-                        article = {
-                            "title": entry.get("title", ""),
-                            "summary": entry.get("summary", ""),
-                            "published": entry.get("published", ""),
-                            "source": source_data["title"],
-                            "link": entry.get("link", "")
-                        }
-                        all_articles.append(article)
-                except Exception as e:
-                    logger.warning(f"Failed to fetch from {source_url}: {e}")
+                for source in sources:
+                    try:
+                        feed = feedparser.parse(source["url"])
+                        for entry in feed.entries[:20]:
+                            article = {
+                                "title": entry.get("title", ""),
+                                "summary": entry.get("summary", ""),
+                                "published": entry.get("published", ""),
+                                "source": source["title"],
+                                "link": entry.get("link", ""),
+                                "source_id": source["id"],
+                                "hash": get_file_hash(entry.get("link", "") + entry.get("title", ""))
+                            }
+                            all_articles.append(article)
+                            
+                            conn.execute(
+                                """
+                                INSERT INTO news_articles (source_id, title, summary, url, published_date, hash)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(hash) DO NOTHING
+                                """,
+                                (article["source_id"], article["title"], article["summary"], article["link"], article["published"], article["hash"])
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch from {source['url']}: {e}")
             
-            # Simple trending analysis - count common keywords
             word_counts = {}
             for article in all_articles:
                 words = re.findall(r'\b\w+\b', article["title"].lower())
                 for word in words:
-                    if len(word) > 3:  # Skip short words
+                    if len(word) > 4 and word not in ['this', 'that', 'with', 'from', 'news']:
                         word_counts[word] = word_counts.get(word, 0) + 1
             
-            # Get top trending words
-            trending_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            trending_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:15]
             
-            return {
+            with get_db_connection() as conn:
+                for word, count in trending_words:
+                    conn.execute(
+                        """
+                        INSERT INTO trending_keywords (keyword, count, category, time_window)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(keyword, time_window, category) DO UPDATE SET
+                            count=excluded.count,
+                            last_seen=CURRENT_TIMESTAMP
+                        """,
+                        (word, count, 'general', time_window)
+                    )
+
+            result = {
                 "success": True,
-                "message": f"Found {len(all_articles)} articles from {len(self.cache)} sources",
+                "message": f"Found {len(all_articles)} articles from {source_count} sources",
                 "total_articles": len(all_articles),
                 "trending_keywords": [{"word": word, "mentions": count} for word, count in trending_words],
                 "recent_articles": all_articles[:20],
                 "time_window": time_window
             }
             
+            output_json_path = self.output_dir / "latest_trending.json"
+            with open(output_json_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2)
+
+            log_to_history("get_trending_topics", "success", metadata={"articles_found": len(all_articles), "sources": source_count})
+            return result
+            
         except Exception as e:
-            logger.error(f"Failed to get trending topics: {e}")
+            logger.exception(f"Failed to get trending topics")
+            log_to_history("get_trending_topics", "error", error_message=str(e))
             return {
                 "success": False,
                 "error": str(e),
@@ -619,28 +747,23 @@ img_processor = ImageProcessor()
 email_processor = EmailProcessor()
 news_processor = NewsProcessor()
 
-# MCP Tool Definitions
+# --- MCP Tool Definitions ---
 @app.list_tools()
 async def list_tools() -> List[types.Tool]:
     """List all available tools"""
     return [
-        # Document tools
         types.Tool(
             name="convert_document",
-            description="Convert document between formats (PDF, DOCX, HTML, Markdown, TXT)",
+            description="Convert document between formats (PDF, DOCX, PPTX, HTML, TXT)",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "source_path": {"type": "string", "description": "Path to source document"},
                     "target_format": {"type": "string", "enum": config.DOC_FORMATS, "description": "Target format"},
-                    "preserve_images": {"type": "boolean", "default": True},
-                    "quality": {"type": "string", "enum": ["high", "medium", "low"], "default": "medium"}
                 },
                 "required": ["source_path", "target_format"]
             }
         ),
-        
-        # Image tools
         types.Tool(
             name="process_image",
             description="Process image with resize, enhance, and format conversion",
@@ -657,37 +780,29 @@ async def list_tools() -> List[types.Tool]:
                 "required": ["image_path", "operations"]
             }
         ),
-        
-        # Email tools
         types.Tool(
             name="search_emails",
-            description="Search through email archives",
+            description="Search through email archives (mbox/eml)",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "archive_path": {"type": "string", "description": "Path to email archive (mbox/eml)"},
                     "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "default": 50}
                 },
                 "required": ["archive_path", "query"]
             }
         ),
-        
         types.Tool(
             name="analyze_communication_patterns",
-            description="Analyze email communication patterns",
+            description="Analyze email communication patterns from an archive",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "archive_path": {"type": "string", "description": "Path to email archive"},
-                    "include_contacts": {"type": "boolean", "default": True},
-                    "time_period": {"type": "string", "default": "all"}
                 },
                 "required": ["archive_path"]
             }
         ),
-        
-        # News tools
         types.Tool(
             name="add_news_source",
             description="Add RSS/news source for monitoring",
@@ -696,12 +811,10 @@ async def list_tools() -> List[types.Tool]:
                 "properties": {
                     "feed_url": {"type": "string", "description": "RSS feed URL"},
                     "category": {"type": "string", "default": "general"},
-                    "priority": {"type": "string", "enum": ["high", "medium", "low"], "default": "medium"}
                 },
                 "required": ["feed_url"]
             }
         ),
-        
         types.Tool(
             name="get_trending_topics",
             description="Get trending topics from news sources",
@@ -709,20 +822,16 @@ async def list_tools() -> List[types.Tool]:
                 "type": "object",
                 "properties": {
                     "time_window": {"type": "string", "enum": ["1h", "6h", "24h", "7d"], "default": "24h"},
-                    "min_mentions": {"type": "integer", "default": 2},
-                    "categories": {"type": "array", "items": {"type": "string"}}
                 }
             }
         ),
-        
-        # Utility tools
         types.Tool(
             name="list_supported_formats",
             description="Get list of supported formats for each service",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string", "enum": ["document", "image", "email", "news", "all"], "default": "all"}
+                    "service": {"type": "string", "enum": ["document", "image", "email", "all"], "default": "all"}
                 }
             }
         )
@@ -734,27 +843,18 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
     try:
         result = None
         
-        # Document tools
         if name == "convert_document":
             result = await doc_processor.convert_document(**arguments)
-        
-        # Image tools
         elif name == "process_image":
             result = await img_processor.process_image(**arguments)
-        
-        # Email tools  
         elif name == "search_emails":
             result = await email_processor.search_emails(**arguments)
         elif name == "analyze_communication_patterns":
             result = await email_processor.analyze_communication_patterns(**arguments)
-        
-        # News tools
         elif name == "add_news_source":
             result = await news_processor.add_news_source(**arguments)
         elif name == "get_trending_topics":
             result = await news_processor.get_trending_topics(**arguments)
-        
-        # Utility tools
         elif name == "list_supported_formats":
             service = arguments.get("service", "all")
             formats = {}
@@ -764,35 +864,17 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
                 formats["image"] = config.IMG_FORMATS
             if service in ["email", "all"]:
                 formats["email"] = config.EMAIL_FORMATS
-            if service in ["news", "all"]:
-                formats["news"] = ["rss", "atom", "xml"]
-            
-            result = {
-                "success": True,
-                "supported_formats": formats,
-                "service": service
-            }
-        
+            result = { "success": True, "supported_formats": formats, "service": service }
         else:
-            result = {
-                "success": False,
-                "error": f"Unknown tool: {name}"
-            }
+            result = { "success": False, "error": f"Unknown tool: {name}" }
         
-        # Format response
-        if result:
-            return [types.TextContent(
-                type="text",
-                text=json.dumps(result, indent=2, default=str)
-            )]
-        else:
-            return [types.TextContent(
-                type="text", 
-                text=json.dumps({"success": False, "error": "No result generated"})
-            )]
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(result, indent=2, default=str)
+        )]
             
     except Exception as e:
-        logger.error(f"Tool call failed: {e}")
+        logger.exception(f"Tool call failed")
         return [types.TextContent(
             type="text",
             text=json.dumps({
@@ -803,7 +885,7 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
             }, indent=2)
         )]
 
-# Resources (optional - for serving files)
+# --- Resources, Prompts, Status, Main, etc. ---
 @app.list_resources()
 async def list_resources() -> List[types.Resource]:
     """List available resources"""
@@ -919,7 +1001,7 @@ async def get_prompt(name: str, arguments: dict) -> types.GetPromptResult:
                         role="user",
                         content=types.TextContent(
                             type="text",
-                            text=f"System Status Report:\n\n{json.dumps(status_info, indent=2)}"
+                            text=f"System Status Report:\n\n{json.dumps(status_info, indent=2, default=str)}"
                         )
                     )
                 ]
@@ -935,7 +1017,7 @@ async def get_prompt(name: str, arguments: dict) -> types.GetPromptResult:
                         role="user",
                         content=types.TextContent(
                             type="text",
-                            text=f"Processing Summary ({time_period}):\n\n{json.dumps(summary_info, indent=2)}"
+                            text=f"Processing Summary ({time_period}):\n\n{json.dumps(summary_info, indent=2, default=str)}"
                         )
                     )
                 ]
@@ -978,6 +1060,14 @@ async def _get_system_status() -> Dict[str, Any]:
         # Check disk space
         disk_usage = shutil.disk_usage(config.BASE_DIR)
         
+        # Get DB stats
+        db_stats = {}
+        with get_db_connection() as conn:
+            db_stats["news_sources"] = conn.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0]
+            db_stats["news_articles"] = conn.execute("SELECT COUNT(*) FROM news_articles").fetchone()[0]
+            db_stats["trending_keywords"] = conn.execute("SELECT COUNT(*) FROM trending_keywords").fetchone()[0]
+            db_stats["processing_history"] = conn.execute("SELECT COUNT(*) FROM processing_history").fetchone()[0]
+            
         return {
             "status": "running",
             "timestamp": datetime.now().isoformat(),
@@ -995,12 +1085,12 @@ async def _get_system_status() -> Dict[str, Any]:
                 "free": disk_usage.free,
                 "percent_used": (disk_usage.used / disk_usage.total) * 100
             },
+            "database_stats": db_stats,
             "supported_formats": {
                 "documents": config.DOC_FORMATS,
                 "images": config.IMG_FORMATS,
                 "email": config.EMAIL_FORMATS
-            },
-            "news_sources": len(news_processor.cache)
+            }
         }
         
     except Exception as e:
@@ -1011,11 +1101,8 @@ async def _get_system_status() -> Dict[str, Any]:
         }
 
 async def _get_processing_summary(time_period: str) -> Dict[str, Any]:
-    """Get processing summary for time period"""
+    """Get processing summary for time period from DB"""
     try:
-        # This is a simplified implementation
-        # In a real system, you'd track processing activities in a database
-        
         cutoff_hours = {
             "1h": 1,
             "24h": 24,
@@ -1023,28 +1110,32 @@ async def _get_processing_summary(time_period: str) -> Dict[str, Any]:
         }.get(time_period, 24)
         
         cutoff_time = datetime.now().timestamp() - (cutoff_hours * 3600)
+        cutoff_iso = datetime.fromtimestamp(cutoff_time).isoformat()
+
+        summary = {}
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT tool_name, status, COUNT(*) as count
+                FROM processing_history
+                WHERE created_at >= ?
+                GROUP BY tool_name, status
+                """,
+                (cutoff_iso,)
+            ).fetchall()
+
+            for row in rows:
+                if row["tool_name"] not in summary:
+                    summary[row["tool_name"]] = {"success": 0, "error": 0}
+                summary[row["tool_name"]][row["status"]] = row["count"]
         
-        # Count recent files
-        recent_files = {}
-        for service_dir in ["documents", "images", "email", "news"]:
-            service_path = config.OUTPUT_DIR / service_dir
-            if service_path.exists():
-                recent_count = 0
-                for file_path in service_path.iterdir():
-                    if file_path.is_file() and file_path.stat().st_mtime > cutoff_time:
-                        recent_count += 1
-                recent_files[service_dir] = recent_count
-            else:
-                recent_files[service_dir] = 0
-        
-        total_recent = sum(recent_files.values())
+        total_ops = sum(s["success"] + s["error"] for s in summary.values())
         
         return {
             "time_period": time_period,
             "summary_generated": datetime.now().isoformat(),
-            "recent_processing": recent_files,
-            "total_recent_files": total_recent,
-            "most_active_service": max(recent_files.items(), key=lambda x: x[1])[0] if total_recent > 0 else "none"
+            "processing_summary": summary,
+            "total_operations": total_ops,
         }
         
     except Exception as e:
@@ -1119,4 +1210,4 @@ if __name__ == "__main__":
         logger.info("Server shutdown requested")
     except Exception as e:
         logger.error(f"Server error: {e}")
-        sys.exit(1) 
+        sys.exit(1)
