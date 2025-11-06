@@ -1,0 +1,11 @@
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Test email for MCP
+Date: Fri, 01 Nov 2025 10:00:00 +0000
+Message-ID: <sample1@example.com>
+
+Hello Bob,
+
+This is a test email to demonstrate email parsing and searching.
+Regards,
+Alice

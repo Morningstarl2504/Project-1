@@ -1,8 +1,162 @@
 {
   "success": true,
-  "message": "Found 0 articles from 0 sources",
-  "total_articles": 0,
-  "trending_keywords": [],
-  "recent_articles": [],
-  "time_window": "24h"
+  "message": "Found 20 articles. Report saved to latest_news.txt",
+  "total_articles_scanned": 20,
+  "matching_articles": 20,
+  "trending_keywords": [
+    {
+      "word": "after",
+      "mentions": 3
+    },
+    {
+      "word": "budget",
+      "mentions": 2
+    },
+    {
+      "word": "mexico",
+      "mentions": 2
+    },
+    {
+      "word": "crime",
+      "mentions": 1
+    },
+    {
+      "word": "fixer",
+      "mentions": 1
+    },
+    {
+      "word": "caught",
+      "mentions": 1
+    },
+    {
+      "word": "offering",
+      "mentions": 1
+    },
+    {
+      "word": "erase",
+      "mentions": 1
+    },
+    {
+      "word": "fines",
+      "mentions": 1
+    },
+    {
+      "word": "migrant",
+      "mentions": 1
+    },
+    {
+      "word": "workers",
+      "mentions": 1
+    },
+    {
+      "word": "watch",
+      "mentions": 1
+    },
+    {
+      "word": "reporter",
+      "mentions": 1
+    },
+    {
+      "word": "confronts",
+      "mentions": 1
+    },
+    {
+      "word": "centre",
+      "mentions": 1
+    }
+  ],
+  "recent_articles": [
+    {
+      "title": "Crime fixer caught by BBC offering to erase \u00a360K fines on migrant workers",
+      "summary": "Calling himself \"the accountant\", the fixer told undercover reporters how he could \u201cconfuse\u201d immigration enforcement.",
+      "published": "Wed, 05 Nov 2025 22:00:04 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/ce3kevkl3pdo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "9dd4a090"
+    },
+    {
+      "title": "Watch: BBC reporter confronts man at centre of illegal worker network",
+      "summary": "The BBC's Ed Thomas confronted Kardos Mateen, who is at the centre of an illegal worker network.",
+      "published": "Wed, 05 Nov 2025 22:00:41 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/videos/cgr4dr4rp74o?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "35130546"
+    },
+    {
+      "title": "Chris Mason: The justice system is failing - the buck stops with Lammy",
+      "summary": "Problems in the prisons and the courts are not new but they are growing and the government doesn't have a grip on them.",
+      "published": "Wed, 05 Nov 2025 20:49:59 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/crmx82ng9gyo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "7bc00041"
+    },
+    {
+      "title": "William announces Earthshot Prize 2025 winners in Rio",
+      "summary": "Winners include a project for making the Atlantic Forest financially viable and a global ocean treaty initiative",
+      "published": "Thu, 06 Nov 2025 04:10:52 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/cy0y50457y9o?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "02575e98"
+    },
+    {
+      "title": "ADHD services shutting door to new NHS patients as demand soars, BBC finds",
+      "summary": "A BBC investigation finds that a host of areas in England are closing waiting lists and others are rationing care.",
+      "published": "Thu, 06 Nov 2025 00:04:46 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/c4gpl150ze4o?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "9168f305"
+    },
+    {
+      "title": "Philippines declares state of calamity as typhoon death toll rises to 114",
+      "summary": "Kalmaegi left the Philippines on Thursday morning and is currently moving toward central Vietnam.",
+      "published": "Thu, 06 Nov 2025 06:49:33 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/c62e0764e6qo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "c4b9fa60"
+    },
+    {
+      "title": "Government considering new tax on EV drivers in Budget",
+      "summary": "The BBC understands there have been \"conversations\" within government about the possibility of a new levy on EVs.",
+      "published": "Thu, 06 Nov 2025 07:50:32 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/c0mxgzpj1dvo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "98bdf035"
+    },
+    {
+      "title": "Interest rates expected to be held as Budget looms",
+      "summary": "Most analysts believe the Bank rate will remain at 4% for now, although there could be a cut in December.",
+      "published": "Thu, 06 Nov 2025 00:10:39 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/c77zkg5504eo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "e80e9078"
+    },
+    {
+      "title": "Miss Universe contestants walk out after organiser berates Miss Mexico",
+      "summary": "Video of the incident, which was live streamed, has been shared widely on the internet.",
+      "published": "Wed, 05 Nov 2025 22:19:46 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/cy40q990g28o?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "32394f54"
+    },
+    {
+      "title": "'Vibe coding' named word of the year by Collins Dictionary",
+      "summary": "The art of making an app by describing it to artificial intelligence (AI) tops 10 new terms on the shortlist.",
+      "published": "Thu, 06 Nov 2025 02:22:22 GMT",
+      "source": "BBC News",
+      "link": "https://www.bbc.com/news/articles/cpd2y053nleo?at_medium=RSS&at_campaign=rss",
+      "source_id": 1,
+      "hash": "92f56df7"
+    }
+  ],
+  "time_window": "24h",
+  "output_path": "D:\\Project-1\\output\\news\\latest_news.txt"
 }

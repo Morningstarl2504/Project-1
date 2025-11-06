@@ -1,10 +1,7 @@
-#mcp_server.py
-
 #!/usr/bin/env python3
 """
 Complete MCP Server for Content & Media Processing
-Standalone implementation with all services integrated
-(*** FINAL STABLE VERSION ***)
+(*** FINAL ROBUST API VERSION - 11/06 ***)
 """
 
 import asyncio
@@ -25,25 +22,32 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-# Processing libraries
+# --- Processing libraries ---
+
+# For Image Processing
 from PIL import Image, ImageEnhance
-import pypandoc
-from docx import Document
-import PyPDF2
-from bs4 import BeautifulSoup
-import markdown
+
+# For News Processing
 import feedparser
-import requests
+import requests # Also used by CloudConvert
+
+# For Email Processing
 import email
 import mailbox
 from email.parser import BytesParser
 from email.policy import default
+
+# For File Type Detection
 import re
 import magic
 
-# <<< LIBRARIES FOR RELIABLE CONVERSION >>>
-import pythoncom
-import win32com.client
+# --- API and Environment Imports ---
+import cloudconvert
+from dotenv import load_dotenv
+import google.generativeai as genai # Added for email summarization
+
+# --- (Old document imports like pypandoc, docx, PyPDF2, pythoncom, win32com.client are REMOVED) ---
+
 
 # Configuration
 class Config:
@@ -70,12 +74,84 @@ class Config:
 config = Config()
 config.__post_init__()
 
+# Load .env file for API keys
+load_dotenv()
+
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize MCP Server
 app = Server("content-media-hub")
+
+# --- Database Setup (CORRECTED) ---
+def init_database():
+    """Initialize database tables"""
+    try:
+        with get_db_connection() as conn:
+            # Processing history table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processing_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tool_name TEXT NOT NULL,
+                    source_path TEXT,
+                    output_path TEXT,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    metadata TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # News sources table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS news_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    title TEXT,
+                    description TEXT,
+                    category TEXT,
+                    status TEXT DEFAULT 'active',
+                    last_updated DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # News articles table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS news_articles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER,
+                    title TEXT,
+                    summary TEXT,
+                    url TEXT,
+                    published_date TEXT,
+                    hash TEXT UNIQUE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (source_id) REFERENCES news_sources (id)
+                )
+            """)
+            
+            # --- START: BUG FIX ---
+            # Added UNIQUE constraint to fix the "ON CONFLICT" error
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trending_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT,
+                    count INTEGER,
+                    category TEXT,
+                    time_window TEXT,
+                    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(keyword, category, time_window) 
+                )
+            """)
+            # --- END: BUG FIX ---
+            
+            conn.commit()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
 
 # --- Database Utility Functions ---
 def get_db_connection():
@@ -95,6 +171,7 @@ def log_to_history(tool_name: str, status: str, source_path: str = None, output_
                 """,
                 (tool_name, source_path, output_path, status, error_message, json.dumps(metadata) if metadata else None)
             )
+            conn.commit() # Make sure to commit the changes
     except Exception as e:
         logger.error(f"Failed to log to database: {e}")
 
@@ -128,23 +205,40 @@ def detect_file_format(filepath: Path) -> str:
             return 'html'
         elif 'image' in mime_type:
             return ext if ext in config.IMG_FORMATS else 'jpg'
-    except:
+    except Exception as e:
+        logger.warning(f"File magic check failed: {e}. Falling back to extension.")
         pass
-    return ext if ext in config.DOC_FORMATS + config.IMG_FORMATS else 'txt'
+    
+    # Fallback to extension if magic fails
+    if ext in config.DOC_FORMATS or ext in config.IMG_FORMATS:
+        return ext
+    else:
+        return 'txt'
 
-# --- Document Processing Service ---
+
+# --- Document Processing Service (ROBUST API VERSION) ---
 class DocumentProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "documents"
         ensure_directory(self.output_dir)
-    
+        
+        # Get API Key from environment.
+        self.api_key = os.getenv("CLOUDCONVERT_API_KEY")
+        if not self.api_key:
+            logger.warning("CLOUDCONVERT_API_KEY not set in .env. Document conversion will fail.")
+        
+        # Configure the API client
+        if self.api_key:
+            cloudconvert.configure(api_key=self.api_key, sandbox=False)
+        else:
+            logger.error("CloudConvert API key not found. Cannot configure API.")
+
+
     async def convert_document(self, source_path: str, target_format: str, **kwargs) -> Dict[str, Any]:
-        """Convert document between formats"""
+        """Convert document between formats using a robust cloud API"""
         try:
-            # Use Path() to handle file paths correctly
             source = Path(source_path)
             if not source.exists():
-                # Try to find the file in the base directory if a full path fails
                 source = config.BASE_DIR / source.name
                 if not source.exists():
                     raise FileNotFoundError(f"Source file not found: {source_path}")
@@ -152,53 +246,24 @@ class DocumentProcessor:
             validate_file_size(source, config.MAX_DOC_SIZE)
             source_format = detect_file_format(source)
 
-            # Generate output path
             output_name = f"{source.stem}.{target_format}"
             output_path = self.output_dir / output_name
 
-            # Perform conversion
-            if source_format == target_format:
-                shutil.copy2(source, output_path)
-                message = "File copied (same format)"
+            if not self.api_key:
+                 raise RuntimeError("Document conversion failed: 'CLOUDCONVERT_API_KEY' is not configured on the server.")
 
-            elif (source_format == 'docx' or source_format == 'doc') and target_format == 'pdf':
-                await self._com_convert_to_pdf(source, output_path, "Word.Application", "Documents", 17)
-                await asyncio.sleep(1.5) # Wait for file lock
-                message = "Converted Document to PDF using Word"
+            # Run the API conversion in a blocking-safe way
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._run_api_conversion, source, output_path, target_format)
             
-            elif (source_format == 'pptx' or source_format == 'ppt') and target_format == 'pdf':
-                await self._com_convert_to_pdf(source, output_path, "PowerPoint.Application", "Presentations", 32)
-                await asyncio.sleep(1.5) # Wait for file lock
-                message = "Converted Presentation to PDF using PowerPoint"
-
-            elif self._can_use_pandoc(source_format, target_format):
-                await self._pandoc_convert(source, output_path, source_format, target_format)
-                message = "Converted using Pandoc"
-            elif source_format == 'pdf' and target_format == 'txt':
-                await self._pdf_to_text(source, output_path)
-                message = "Converted PDF to text"
-            elif source_format == 'docx' and target_format == 'txt':
-                await self._docx_to_text(source, output_path)
-                message = "Converted DOCX to text"
-            else:
-                raise ValueError(f"Unsupported conversion: from '{source_format}' to '{target_format}'")
-
-            metadata = await self._get_document_metadata(output_path)
-
-            result = {
-                "success": True,
-                "message": message,
-                "output_path": str(output_path),
-                "source_format": source_format,
-                "target_format": target_format,
-                "file_size": output_path.stat().st_size,
-                "metadata": metadata
-            }
+            result["source_format"] = source_format
+            result["metadata"] = await self._get_document_metadata(output_path)
+            
             log_to_history("convert_document", "success", str(source), str(output_path), metadata=result)
             return result
 
         except Exception as e:
-            logger.exception(f"Document conversion failed")
+            logger.exception(f"Document conversion failed: {e}")
             log_to_history("convert_document", "error", str(source_path), error_message=str(e))
             return {
                 "success": False,
@@ -206,83 +271,63 @@ class DocumentProcessor:
                 "source_path": str(source_path),
                 "target_format": target_format
             }
-    
-    def _can_use_pandoc(self, source_format: str, target_format: str) -> bool:
-        """Check if pandoc can handle conversion"""
-        pandoc_sources = {'md', 'markdown', 'html', 'htm', 'docx', 'txt', 'rtf'}
-        pandoc_targets = {'md', 'markdown', 'html', 'htm', 'docx', 'txt', 'rtf', 'pdf'} 
-        return source_format in pandoc_sources and target_format in pandoc_targets
-    
-    async def _pandoc_convert(self, source: Path, output: Path, source_fmt: str, target_fmt: str):
-        """Convert using pandoc"""
-        try:
-            extra_args = []
-            if target_fmt == 'html':
-                extra_args = ['--standalone']
-            elif target_fmt == 'pdf':
-                extra_args = ['--pdf-engine=wkhtmltopdf']
 
-            pypandoc.convert_file(
-                str(source), target_fmt, outputfile=str(output),
-                extra_args=extra_args
-            )
-        except Exception as e:
-            if 'wkhtmltopdf' in str(e):
-                raise RuntimeError("Pandoc conversion failed: PDF engine 'wkhtmltopdf' not found. Please install it to convert to PDF.")
-            raise RuntimeError(f"Pandoc conversion failed: {e}")
-    
-    async def _pdf_to_text(self, source: Path, output: Path):
-        """Convert PDF to text"""
-        try:
-            with open(source, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                text_content = []
-                for page in reader.pages:
-                    text_content.append(page.extract_text())
-            
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write('\n\n'.join(text_content))
-        except Exception as e:
-            raise RuntimeError(f"PDF to text conversion failed: {e}")
-    
-    async def _docx_to_text(self, source: Path, output: Path):
-        """Convert DOCX to text"""
-        try:
-            doc = Document(str(source))
-            paragraphs = [p.text for p in doc.paragraphs]
-            
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(paragraphs))
-        except Exception as e:
-            raise RuntimeError(f"DOCX to text conversion failed: {e}")
-    
-    async def _to_html(self, source: Path, output: Path, source_fmt: str):
-        """Convert various formats to HTML"""
-        if source_fmt in ['md', 'markdown']:
-            with open(source, 'r', encoding='utf-8') as f:
-                content = f.read()
-            html_content = markdown.markdown(content)
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write(f"<html><body>{html_content}</body></html>")
-        elif source_fmt == 'txt':
-            with open(source, 'r', encoding='utf-8') as f:
-                content = f.read()
-            html_content = f"<html><body><pre>{content}</pre></body></html>"
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-    
-    async def _from_html(self, source: Path, output: Path, target_fmt: str):
-        """Convert HTML to other formats"""
-        if target_fmt == 'txt':
-            with open(source, 'r', encoding='utf-8') as f:
-                content = f.read()
-            soup = BeautifulSoup(content, 'html.parser')
-            text_content = soup.get_text()
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write(text_content)
-    
+    def _run_api_conversion(self, source_file: Path, output_file: Path, target_format: str) -> Dict[str, Any]:
+        """
+        Synchronous helper function to run the CloudConvert job.
+        This runs in an executor to avoid blocking the async server.
+        """
+        job = cloudconvert.Job.create(payload={
+            "tasks": {
+                "import-file": {
+                    "operation": "import/upload"
+                },
+                "convert-file": {
+                    "operation": "convert",
+                    "input": "import-file",
+                    "output_format": target_format,
+                    "filename": f"{source_file.stem}.{target_format}"
+                },
+                "export-file": {
+                    "operation": "export/url",
+                    "input": "convert-file"
+                }
+            }
+        })
+
+        # Upload the file
+        upload_task_id = job['tasks'][0]['id']
+        upload_task = cloudconvert.Task.find(id=upload_task_id)
+        cloudconvert.Task.upload(file_name=str(source_file), task=upload_task)
+
+        # Wait for job to finish
+        job = cloudconvert.Job.wait(id=job['id'])
+        
+        if job.get("status") == "error":
+            raise RuntimeError(f"CloudConvert API error: {job.get('message', 'Unknown error')}")
+
+        # Get the exported file
+        export_task = [t for t in job.get("tasks", []) if t.get("name") == "export-file"][0]
+        file_data = export_task.get("result", {}).get("files", [])
+        
+        if not file_data:
+            raise RuntimeError("CloudConvert API failed: No file was returned.")
+
+        # Download the file
+        download_url = file_data[0]['url']
+        response = requests.get(download_url)
+        output_file.write_bytes(response.content)
+
+        return {
+            "success": True,
+            "message": f"Converted {source_file.name} to {target_format} using CloudConvert",
+            "output_path": str(output_file),
+            "target_format": target_format,
+            "file_size": output_file.stat().st_size
+        }
+
     async def _get_document_metadata(self, filepath: Path) -> Dict[str, Any]:
-        """Extract document metadata"""
+        """Extract document metadata (remains the same)"""
         stats = filepath.stat()
         return {
             "file_size": stats.st_size,
@@ -290,38 +335,6 @@ class DocumentProcessor:
             "modified": datetime.fromtimestamp(stats.st_mtime).isoformat(),
             "format": detect_file_format(filepath)
         }
-        
-    async def _com_convert_to_pdf(self, source: Path, output: Path, app_name: str, collection_name: str, pdf_format_type: int):
-        """Generic COM converter for Word and PowerPoint"""
-        
-        def com_task():
-            pythoncom.CoInitialize()
-            app = None
-            doc = None
-            try:
-                src_abs = str(source.resolve())
-                out_abs = str(output.resolve())
-                
-                app = win32com.client.Dispatch(app_name)
-                collection = getattr(app, collection_name)
-                doc = collection.Open(src_abs, WithWindow=False)
-                
-                doc.SaveAs(out_abs, pdf_format_type) # 17 for Word, 32 for PowerPoint
-                
-            except Exception as e:
-                raise RuntimeError(f"{app_name} (COM) conversion failed: {e}. Do you have Microsoft Office installed?")
-            finally:
-                if doc:
-                    doc.Close()
-                if app:
-                    app.Quit()
-                pythoncom.CoUninitialize()
-
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, com_task)
-        except Exception as e:
-            raise RuntimeError(f"COM conversion failed: {e}")
 
 # --- Image Processing Service ---
 class ImageProcessor:
@@ -444,11 +457,106 @@ class ImageProcessor:
             stats = filepath.stat()
             return {"file_size": stats.st_size, "format": "unknown"}
 
-# --- Email Processing Service ---
+# --- Email Processing Service (UPGRADED) ---
 class EmailProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "email"
         ensure_directory(self.output_dir)
+        
+        # --- NEW: Configure Gemini API for summarization ---
+        self.genai_model = None
+        try:
+            api_key = os.getenv('GEMINI_API_KEY')
+            if not api_key:
+                logger.warning("GEMINI_API_KEY not set in .env. Email summarization will fail.")
+            else:
+                genai.configure(api_key=api_key)
+                self.genai_model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-1.5-flash'))
+                logger.info("EmailProcessor configured for Gemini summarization.")
+        except Exception as e:
+            logger.error(f"Failed to configure Gemini for EmailProcessor: {e}")
+
+    async def _summarize_text_with_gemini(self, text_content: str) -> str:
+        """Helper to call Gemini API for summarization."""
+        if not self.genai_model:
+            raise RuntimeError("Gemini API is not configured on the server for summarization.")
+        
+        prompt = f"""
+        You are a helpful assistant. Please provide a concise, bullet-pointed summary
+        of the following email content. Focus on key topics, questions, and action items.
+        
+        EMAIL CONTENT:
+        ---
+        {text_content}
+        ---
+        
+        SUMMARY:
+        """
+        
+        try:
+            # Use run_in_executor for the blocking genai call
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, self.genai_model.generate_content, prompt
+            )
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Gemini summarization failed: {e}")
+            raise RuntimeError(f"AI summarization failed: {e}")
+
+    # --- NEW TOOL ---
+    async def summarize_emails(self, archive_path: str, **kwargs) -> Dict[str, Any]:
+        """Summarizes the content of an email archive."""
+        try:
+            archive = Path(archive_path)
+            if not archive.exists():
+                archive = config.BASE_DIR / archive.name
+                if not archive.exists():
+                    raise FileNotFoundError(f"Email archive not found: {archive_path}")
+
+            validate_file_size(archive, config.MAX_EMAIL_SIZE)
+            emails = await self._parse_email_archive(archive)
+            
+            if not emails:
+                raise ValueError("No emails found in archive to summarize.")
+
+            # Combine all email content into one large text block
+            full_text_content = ""
+            for email_data in emails:
+                full_text_content += f"--- EMAIL FROM: {email_data.get('sender', 'N/A')} | SUBJECT: {email_data.get('subject', 'N/A')} ---\n"
+                full_text_content += email_data.get('content', '') + "\n\n"
+
+            # Summarize the combined text
+            summary = await self._summarize_text_with_gemini(full_text_content)
+            
+            # --- NEW: Save summary to .txt file ---
+            output_name = f"{archive.stem}_summary.txt"
+            output_path = self.output_dir / output_name
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(f"Summary for: {archive_path}\n")
+                f.write(f"Total Emails Found: {len(emails)}\n")
+                f.write("="*30 + "\n\n")
+                f.write(summary)
+            
+            result = {
+                "success": True,
+                "message": f"Successfully summarized {len(emails)} email(s). Saved to {output_path.name}",
+                "emails_found": len(emails),
+                "summary": summary, # Also return summary in response
+                "output_path": str(output_path), # Return the new file path
+                "source_path": str(archive_path)
+            }
+            log_to_history("summarize_emails", "success", str(archive), str(output_path), metadata={"emails_found": len(emails)})
+            return result
+            
+        except Exception as e:
+            logger.exception(f"Email summarization failed")
+            log_to_history("summarize_emails", "error", str(archive_path), error_message=str(e))
+            return {
+                "success": False,
+                "error": str(e),
+                "archive_path": archive_path
+            }
     
     async def search_emails(self, archive_path: str, query: str, **kwargs) -> Dict[str, Any]:
         """Search emails in archive"""
@@ -608,7 +716,7 @@ class EmailProcessor:
         sender = email_data.get("sender", "").lower()
         return "noreply" not in sender and "no-reply" not in sender
 
-# --- News Processing Service ---
+# --- News Processing Service (UPGRADED) ---
 class NewsProcessor:
     def __init__(self):
         self.output_dir = config.OUTPUT_DIR / "news"
@@ -629,6 +737,8 @@ class NewsProcessor:
             }
             
             with get_db_connection() as conn:
+                # --- START: SQL BUG FIX ---
+                # This query now matches the 8-column schema from init_database()
                 conn.execute(
                     """
                     INSERT INTO news_sources (url, title, description, category, last_updated)
@@ -637,10 +747,11 @@ class NewsProcessor:
                         title=excluded.title,
                         description=excluded.description,
                         category=excluded.category,
-                        last_updated=excluded.last_updated
+                        last_updated=?
                     """,
                     (source_data["url"], source_data["title"], source_data["description"], source_data["category"], datetime.now().isoformat())
                 )
+                # --- END: SQL BUG FIX ---
             
             log_to_history("add_news_source", "success", feed_url, metadata=source_data)
             return {
@@ -663,6 +774,9 @@ class NewsProcessor:
         all_articles = []
         source_count = 0
         
+        # --- NEW: Get optional keyword from arguments ---
+        keyword_filter = kwargs.get("category_keyword", "").lower()
+
         try:
             with get_db_connection() as conn:
                 sources = conn.execute("SELECT id, url, title FROM news_sources WHERE status='active'").fetchall()
@@ -695,10 +809,19 @@ class NewsProcessor:
                         logger.warning(f"Failed to fetch from {source['url']}: {e}")
             
             word_counts = {}
-            for article in all_articles:
+            # --- NEW: Filter articles if keyword is provided ---
+            if keyword_filter:
+                filtered_articles = [
+                    article for article in all_articles 
+                    if keyword_filter in article["title"].lower() or keyword_filter in article["summary"].lower()
+                ]
+            else:
+                filtered_articles = all_articles
+
+            for article in filtered_articles:
                 words = re.findall(r'\b\w+\b', article["title"].lower())
                 for word in words:
-                    if len(word) > 4 and word not in ['this', 'that', 'with', 'from', 'news']:
+                    if len(word) > 4 and word not in ['this', 'that', 'with', 'from', 'news', keyword_filter]:
                         word_counts[word] = word_counts.get(word, 0) + 1
             
             trending_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:15]
@@ -709,25 +832,42 @@ class NewsProcessor:
                         """
                         INSERT INTO trending_keywords (keyword, count, category, time_window)
                         VALUES (?, ?, ?, ?)
-                        ON CONFLICT(keyword, time_window, category) DO UPDATE SET
+                        ON CONFLICT(keyword, category, time_window) DO UPDATE SET
                             count=excluded.count,
                             last_seen=CURRENT_TIMESTAMP
                         """,
-                        (word, count, 'general', time_window)
+                        (word, count, keyword_filter if keyword_filter else 'general', time_window)
                     )
+            
+            # --- NEW: Create .txt output as requested ---
+            output_txt_path = self.output_dir / f"{keyword_filter if keyword_filter else 'latest'}_news.txt"
+            with open(output_txt_path, 'w', encoding='utf-8') as f:
+                f.write(f"News Report for: '{keyword_filter if keyword_filter else 'All Topics'}'\n")
+                f.write(f"Found {len(filtered_articles)} matching articles.\n")
+                f.write("="*30 + "\n\n")
+                for article in filtered_articles[:30]: # Write top 30 articles to txt
+                    f.write(f"Title: {article['title']}\n")
+                    f.write(f"Source: {article['source']}\n")
+                    f.write(f"Link: {article['link']}\n")
+                    f.write(f"Published: {article['published']}\n")
+                    f.write(f"Summary: {article['summary']}\n\n")
+                    f.write("-"*30 + "\n\n")
 
             result = {
                 "success": True,
-                "message": f"Found {len(all_articles)} articles from {source_count} sources",
-                "total_articles": len(all_articles),
+                "message": f"Found {len(filtered_articles)} articles. Report saved to {output_txt_path.name}",
+                "total_articles_scanned": len(all_articles),
+                "matching_articles": len(filtered_articles),
                 "trending_keywords": [{"word": word, "mentions": count} for word, count in trending_words],
-                "recent_articles": all_articles[:20],
-                "time_window": time_window
+                "recent_articles": filtered_articles[:10], # Show 10 in JSON
+                "time_window": time_window,
+                "output_path": str(output_txt_path) # Add the new output path
             }
             
+            # Save the JSON output as well
             output_json_path = self.output_dir / "latest_trending.json"
             with open(output_json_path, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2)
+                json.dump(result, f, indent=2, default=str)
 
             log_to_history("get_trending_topics", "success", metadata={"articles_found": len(all_articles), "sources": source_count})
             return result
@@ -803,6 +943,21 @@ async def list_tools() -> List[types.Tool]:
                 "required": ["archive_path"]
             }
         ),
+        
+        # --- NEW TOOL DEFINITION ---
+        types.Tool(
+            name="summarize_emails",
+            description="Reads an entire email archive (.mbox or .eml) and generates a concise summary of all content.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "archive_path": {"type": "string", "description": "Path to email archive (mbox/eml)"},
+                },
+                "required": ["archive_path"]
+            }
+        ),
+        # --- END NEW TOOL ---
+
         types.Tool(
             name="add_news_source",
             description="Add RSS/news source for monitoring",
@@ -817,11 +972,12 @@ async def list_tools() -> List[types.Tool]:
         ),
         types.Tool(
             name="get_trending_topics",
-            description="Get trending topics from news sources",
+            description="Get trending topics from news sources. Can optionally filter by a category keyword.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "time_window": {"type": "string", "enum": ["1h", "6h", "24h", "7d"], "default": "24h"},
+                    "category_keyword": {"type": "string", "description": "A keyword to filter articles by (e.g., 'sports')"}
                 }
             }
         ),
@@ -851,6 +1007,12 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
             result = await email_processor.search_emails(**arguments)
         elif name == "analyze_communication_patterns":
             result = await email_processor.analyze_communication_patterns(**arguments)
+        
+        # --- NEW TOOL HANDLER ---
+        elif name == "summarize_emails":
+            result = await email_processor.summarize_emails(**arguments)
+        # --- END NEW TOOL ---
+
         elif name == "add_news_source":
             result = await news_processor.add_news_source(**arguments)
         elif name == "get_trending_topics":
@@ -874,7 +1036,7 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
         )]
             
     except Exception as e:
-        logger.exception(f"Tool call failed")
+        logger.exception(f"Tool call failed: {name}")
         return [types.TextContent(
             type="text",
             text=json.dumps({
@@ -882,10 +1044,10 @@ async def call_tool(name: str, arguments: dict) -> List[types.TextContent]:
                 "error": str(e),
                 "tool": name,
                 "arguments": arguments
-            }, indent=2)
+            }, indent=2, default=str)
         )]
 
-# --- Resources, Prompts, Status, Main, etc. ---
+# --- Resources ---
 @app.list_resources()
 async def list_resources() -> List[types.Resource]:
     """List available resources"""
@@ -898,7 +1060,7 @@ async def list_resources() -> List[types.Resource]:
             for file_path in service_path.iterdir():
                 if file_path.is_file():
                     resources.append(types.Resource(
-                        uri=f"file://{file_path}",
+                        uri=f"file://{file_path.resolve()}", # Use resolve() for a full path
                         name=f"{service_dir}/{file_path.name}",
                         description=f"Processed {service_dir[:-1]} file",
                         mimeType=_get_mime_type(file_path)
@@ -914,8 +1076,8 @@ async def read_resource(uri: str) -> str:
             file_path = Path(uri[7:])  # Remove file:// prefix
             
             # Security check - ensure file is in output directory
-            if not str(file_path).startswith(str(config.OUTPUT_DIR)):
-                raise ValueError("Access denied: File outside output directory")
+            if not file_path.resolve().is_relative_to(config.OUTPUT_DIR.resolve()):
+                 raise ValueError("Access denied: File outside output directory")
             
             if not file_path.exists():
                 raise FileNotFoundError(f"Resource not found: {uri}")
@@ -938,7 +1100,6 @@ async def read_resource(uri: str) -> str:
         logger.error(f"Failed to read resource {uri}: {e}")
         raise
 
-# Utility functions for resources
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for file"""
     try:
@@ -965,7 +1126,7 @@ def _is_text_file(file_path: Path) -> bool:
     text_extensions = {'.txt', '.html', '.htm', '.md', '.json', '.xml', '.csv'}
     return file_path.suffix.lower() in text_extensions
 
-# Health check and status
+# --- Prompts ---
 @app.list_prompts()
 async def list_prompts() -> List[types.Prompt]:
     """List available prompts"""
@@ -1062,11 +1223,15 @@ async def _get_system_status() -> Dict[str, Any]:
         
         # Get DB stats
         db_stats = {}
-        with get_db_connection() as conn:
-            db_stats["news_sources"] = conn.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0]
-            db_stats["news_articles"] = conn.execute("SELECT COUNT(*) FROM news_articles").fetchone()[0]
-            db_stats["trending_keywords"] = conn.execute("SELECT COUNT(*) FROM trending_keywords").fetchone()[0]
-            db_stats["processing_history"] = conn.execute("SELECT COUNT(*) FROM processing_history").fetchone()[0]
+        try:
+            with get_db_connection() as conn:
+                db_stats["news_sources"] = conn.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0]
+                db_stats["news_articles"] = conn.execute("SELECT COUNT(*) FROM news_articles").fetchone()[0]
+                db_stats["trending_keywords"] = conn.execute("SELECT COUNT(*) FROM trending_keywords").fetchone()[0]
+                db_stats["processing_history"] = conn.execute("SELECT COUNT(*) FROM processing_history").fetchone()[0]
+        except Exception as db_e:
+            logger.error(f"Database stats failed: {db_e}")
+            db_stats = {"error": str(db_e)}
             
         return {
             "status": "running",
@@ -1166,6 +1331,11 @@ async def main():
     
     # Perform initial setup
     try:
+        # --- START: BUG FIX ---
+        # Initialize database *before* initializing processors
+        init_database()
+        # --- END: BUG FIX ---
+        
         # Create required directories
         config.__post_init__()
         

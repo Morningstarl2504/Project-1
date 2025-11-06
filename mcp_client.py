@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 """
 Enhanced NLP MCP Client with Conversational Interface
-(*** FINAL STABLE VERSION ***)
+(*** FINAL STABLE VERSION - Bug Fix 11/06 ***)
 """
 
 import asyncio
@@ -24,7 +24,7 @@ load_dotenv()
 class Config:
     def __init__(self):
         self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-        self.GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+        self.GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash') # Using your confirmed model
         
         self.MCP_SERVER_SCRIPT = os.getenv('MCP_SERVER_SCRIPT', 'mcp_server.py') 
         
@@ -126,7 +126,12 @@ Respond ONLY with the JSON, no additional text.
                 None, self.model.generate_content, analysis_prompt
             )
             
-            return self._parse_intent_response(response.text)
+            parsed_response = self._parse_intent_response(response.text)
+
+            # Log the PARSED response
+            logger.info(f"Intent analysis: {parsed_response.get('intent_type', 'unknown')} (confidence: {parsed_response.get('confidence', 0.0)})")
+            
+            return parsed_response
             
         except Exception as e:
             logger.error(f"Intent analysis failed: {e}")
@@ -142,7 +147,8 @@ Respond ONLY with the JSON, no additional text.
             return "document_processing"
         elif "image" in tool_name or "process" in tool_name:
             return "image_processing"
-        elif "email" in tool_name or "search" in tool_name:
+        # --- UPDATED: Added 'summarize' ---
+        elif "email" in tool_name or "search" in tool_name or "summarize" in tool_name:
             return "email_analysis"
         elif "news" in tool_name or "trending" in tool_name:
             return "news_monitoring"
@@ -210,7 +216,7 @@ PARAMETER HANDLING:
 - Use actual file paths if mentioned in the request
 - Use placeholders like "USER_FILE_PATH" if file not specified
 - Include all required parameters
-- Set realistic default values where appropriate
+- Set realistic default values where appropriate (e.g., 'sports' for a sports news query)
 
 Respond ONLY with JSON.
 """
@@ -430,6 +436,14 @@ class SimpleMCPClient:
                 try:
                     # The server now returns valid JSON
                     parsed_result = json.loads(content_text)
+                    
+                    # --- START: DIAGNOSTIC LOGGING ---
+                    # This will log the REAL error from the server if the tool fails.
+                    if not parsed_result.get("success"):
+                        logger.error(f"Server-side tool failure. Full JSON response:")
+                        logger.error(json.dumps(parsed_result, indent=2))
+                    # --- END: DIAGNOSTIC LOGGING ---
+
                     return {
                         "success": True, # Client-side success
                         "result": parsed_result, # Server-side result
@@ -473,8 +487,12 @@ class SimpleMCPClient:
         
         line = await self.process.stdout.readline()
         if not line:
-            stderr_data = await asyncio.wait_for(self.process.stderr.read(1024), timeout=1.0)
-            logger.error(f"No response from server. STDERR: {stderr_data.decode()}")
+            stderr_data = b""
+            try:
+                stderr_data = await asyncio.wait_for(self.process.stderr.read(1024), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass # No stderr, that's fine
+            logger.error(f"No response from server. STDERR: {stderr_data.decode(errors='replace')}")
             raise Exception("No response from server - connection may be closed")
         
         return json.loads(line.decode().strip())
@@ -527,7 +545,8 @@ class ConversationalMCPClient:
                 
         except Exception as e:
             logger.error(f"Error processing user input: {e}")
-            return "I'm sorry, I encountered an error processing your request. Please try again."
+            # Fallback to conversation on error
+            return await self.gemini.have_conversation(user_input, {"error": str(e)})
     
     async def _handle_tool_request(self, user_input: str, intent_analysis: Dict) -> str:
         """Handle requests that require MCP tool execution"""
@@ -593,7 +612,6 @@ class ConversationalMCPClient:
         for key, value in parameters.items():
             if isinstance(value, str) and ("USER_FILE_PATH" in value or "placeholder" in value.lower()):
                 if extracted_files:
-                    # <<< FIX: Use the FULL extracted path >>>
                     resolved[key] = extracted_files[0]
                 else:
                     pass # Keep placeholder
@@ -625,7 +643,6 @@ class ConversationalMCPClient:
                 tool_name = res.get("tool_name", "Unknown tool")
                 result_data = res.get("result", {})
                 
-                # <<< FIX: Use the REAL message from the server >>>
                 message = result_data.get("message", "Completed successfully")
                 response_parts.append(f"- {tool_name}: {message}")
 
@@ -637,7 +654,6 @@ class ConversationalMCPClient:
             for res in server_failures:
                 tool_name = res.get("tool_name", "Unknown tool")
                 result_data = res.get("result", {})
-                # <<< FIX: Use the REAL error from the server >>>
                 error = result_data.get("error", "Unknown error from server")
                 response_parts.append(f"- {tool_name}: {error}")
         
@@ -656,11 +672,10 @@ class ConversationalMCPClient:
         print(f"Available tools: {len(self.mcp_client.available_tools)}")
         print(f"AI Model: {config.GEMINI_MODEL}")
         
-        # <<< UPDATED MENU >>>
         print("\nI can help you with:")
         print("• Document Conversion (DOCX, PPTX, PDF, HTML, TXT, etc.)")
         print("• Image Processing (resize, enhance, format conversion)")
-        print("• Email Archive Analysis (search, top contacts)")
+        print("• Email Archive Analysis (search, top contacts, summarize)")
         print("• News Monitoring (add RSS feeds, get trending topics)")
         print("• General questions and conversation")
         

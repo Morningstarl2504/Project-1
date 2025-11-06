@@ -1,0 +1,30 @@
+From alice@example.com Fri Nov 01 10:00:00 2025
+From: Alice <alice@example.com>
+To: Project Team <team@example.com>
+Date: Fri, 01 Nov 2025 10:00:00 +0000
+Subject: Project update
+Message-ID: <msg1@example.com>
+
+Hello team,
+
+Just a quick update. The project is on track. We will discuss the new document conversion feature next week.
+
+From bob@example.com Fri Nov 01 12:30:00 2025
+From: Bob <bob@example.com>
+To: Alice <alice@example.com>
+Date: Fri, 01 Nov 2025 12:30:00 +0000
+Subject: Re: Project update
+Message-ID: <msg2@example.com>
+
+Thanks, Alice. I have some new specifications for the image processing tool. Let's add that to the agenda.
+
+From alice@example.com Sat Nov 02 15:00:00 2025
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Date: Sat, 02 Nov 2025 15:00:00 +0000
+Subject: Important: New server credentials
+Message-ID: <msg3@example.com>
+
+Team,
+
+Please find the new credentials for the test server. This is a critical update.
