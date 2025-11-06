@@ -5,5 +5,11 @@ feedparser>=6.0.10
 requests>=2.28.0
 python-magic-bin
 python-dotenv>=1.0.0
-cloudconvert
 google-generativeai
+
+# --- New Local Conversion Libraries ---
+pypandoc
+PyPDF2
+python-docx
+python-pptx
+# Note: cloudconvert is no longer needed

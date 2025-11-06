@@ -419,7 +419,11 @@ class SimpleMCPClient:
             }
             
             await self._send_message(tool_message)
-            response = await asyncio.wait_for(self._receive_message(), timeout=30.0)
+            
+            # --- START: BUG FIX ---
+            # Use the timeout from the config, not a hardcoded 30.0
+            response = await asyncio.wait_for(self._receive_message(), timeout=float(config.MCP_SERVER_TIMEOUT))
+            # --- END: BUG FIX ---
             
             if response.get("error"):
                 return {
@@ -437,12 +441,9 @@ class SimpleMCPClient:
                     # The server now returns valid JSON
                     parsed_result = json.loads(content_text)
                     
-                    # --- START: DIAGNOSTIC LOGGING ---
-                    # This will log the REAL error from the server if the tool fails.
                     if not parsed_result.get("success"):
                         logger.error(f"Server-side tool failure. Full JSON response:")
                         logger.error(json.dumps(parsed_result, indent=2))
-                    # --- END: DIAGNOSTIC LOGGING ---
 
                     return {
                         "success": True, # Client-side success
@@ -462,7 +463,18 @@ class SimpleMCPClient:
                 "result": {"success": True, "message": "Tool executed successfully (No content)"},
                 "tool_name": tool_name
             }
-            
+
+        # --- START: BUG FIX ---
+        # Explicitly catch TimeoutError to provide a clear error message
+        except asyncio.TimeoutError:
+            error_msg = f"Tool call timed out after {config.MCP_SERVER_TIMEOUT} seconds. The conversion may be running in the background."
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "tool_name": tool_name
+            }
+        # --- END: BUG FIX ---
         except Exception as e:
             logger.error(f"Tool execution failed: {e}")
             return {

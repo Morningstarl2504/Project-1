@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Complete MCP Server for Content & Media Processing
-(*** FINAL ROBUST API VERSION - 11/06 ***)
+(*** ROBUST LOCAL PANDOC VERSION - 11/06 - HANG FIX ***)
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from PIL import Image, ImageEnhance
 
 # For News Processing
 import feedparser
-import requests # Also used by CloudConvert
+import requests 
 
 # For Email Processing
 import email
@@ -41,13 +41,23 @@ from email.policy import default
 import re
 import magic
 
+# --- Local Document Conversion ---
+import pypandoc
+import PyPDF2
+import docx  # python-docx
+import pptx  # python-pptx
+
 # --- API and Environment Imports ---
-import cloudconvert
+# import cloudconvert # No longer needed
 from dotenv import load_dotenv
-import google.generativeai as genai # Added for email summarization
+import google.generativeai as genai 
 
-# --- (Old document imports like pypandoc, docx, PyPDF2, pythoncom, win32com.client are REMOVED) ---
+# --- NEW: Configure pypandoc to NOT download binaries ---
+# This forces it to use the system-installed pandoc and fail fast if it's missing.
+os.environ['PYPANDOC_DONT_DOWNLOAD'] = '1' 
 
+# Load .env file for API keys
+load_dotenv()
 
 # Configuration
 class Config:
@@ -73,9 +83,6 @@ class Config:
 
 config = Config()
 config.__post_init__()
-
-# Load .env file for API keys
-load_dotenv()
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -203,6 +210,10 @@ def detect_file_format(filepath: Path) -> str:
             return 'pptx'
         elif 'html' in mime_type:
             return 'html'
+        elif 'rtf' in mime_type:
+            return 'rtf'
+        elif 'markdown' in mime_type or ext == 'md':
+            return 'markdown'
         elif 'image' in mime_type:
             return ext if ext in config.IMG_FORMATS else 'jpg'
     except Exception as e:
@@ -216,125 +227,1308 @@ def detect_file_format(filepath: Path) -> str:
         return 'txt'
 
 
-# --- Document Processing Service (ROBUST API VERSION) ---
+# --- Document Processing Service (LOCAL PANDOC VERSION - HANG FIX) ---
 class DocumentProcessor:
+
+    """
+
+    Robust document processor using Pypandoc for local file conversion.
+
+    Requires Pandoc system package to be installed on the machine.
+
+    
+
+    Installation:
+
+        - Windows: choco install pandoc
+
+        - macOS: brew install pandoc
+
+        - Linux: sudo apt-get install pandoc
+
+    """
+
+    
+
+    # Supported input formats and their MIME types
+
+    FORMAT_MIME_TYPES = {
+
+        'pdf': 'application/pdf',
+
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+
+        'doc': 'application/msword',
+
+        'html': 'text/html',
+
+        'htm': 'text/html',
+
+        'md': 'text/markdown',
+
+        'markdown': 'text/markdown',
+
+        'txt': 'text/plain',
+
+        'rtf': 'application/rtf',
+
+        'odt': 'application/vnd.oasis.opendocument.text',
+
+        'tex': 'application/x-latex',
+
+        'latex': 'application/x-latex',
+
+        'epub': 'application/epub+zip',
+
+    }
+
+    
+
+    # Pandoc format names (some differ from file extensions)
+
+    PANDOC_FORMAT_MAP = {
+
+        'docx': 'docx',
+
+        'doc': 'docx',  # Convert .doc to docx first
+
+        'pdf': 'pdf',
+
+        'html': 'html',
+
+        'htm': 'html',
+
+        'md': 'markdown',
+
+        'markdown': 'markdown',
+
+        'txt': 'plain',
+
+        'rtf': 'rtf',
+
+        'odt': 'odt',
+
+        'tex': 'latex',
+
+        'latex': 'latex',
+
+        'epub': 'epub',
+
+    }
+
+    
+
+    # Format compatibility matrix (source -> acceptable targets)
+
+    FORMAT_COMPATIBILITY = {
+
+        'pdf': ['docx', 'txt', 'html', 'md'],
+
+        'docx': ['pdf', 'txt', 'html', 'md', 'odt', 'rtf', 'epub'],
+
+        'doc': ['docx', 'pdf', 'txt', 'html', 'odt'],
+
+        'html': ['pdf', 'docx', 'txt', 'md', 'odt', 'epub'],
+
+        'txt': ['pdf', 'docx', 'html', 'md', 'odt'],
+
+        'md': ['pdf', 'docx', 'html', 'txt', 'odt', 'epub', 'rtf'],
+
+        'rtf': ['pdf', 'docx', 'txt', 'html', 'odt'],
+
+        'odt': ['pdf', 'docx', 'html', 'txt', 'md'],
+
+        'tex': ['pdf', 'html', 'txt', 'docx'],
+
+        'epub': ['pdf', 'docx', 'html', 'txt', 'md'],
+
+    }
+
+    
+
+    # Retry settings
+
+    MAX_RETRIES = 2
+
+    RETRY_DELAY = 1  # seconds
+
+    
+
     def __init__(self):
-        self.output_dir = config.OUTPUT_DIR / "documents"
-        ensure_directory(self.output_dir)
-        
-        # Get API Key from environment.
-        self.api_key = os.getenv("CLOUDCONVERT_API_KEY")
-        if not self.api_key:
-            logger.warning("CLOUDCONVERT_API_KEY not set in .env. Document conversion will fail.")
-        
-        # Configure the API client
-        if self.api_key:
-            cloudconvert.configure(api_key=self.api_key, sandbox=False)
-        else:
-            logger.error("CloudConvert API key not found. Cannot configure API.")
 
+        """Initialize DocumentProcessor and verify Pandoc installation"""
 
-    async def convert_document(self, source_path: str, target_format: str, **kwargs) -> Dict[str, Any]:
-        """Convert document between formats using a robust cloud API"""
+        self.output_dir = config.OUTPUT_DIR/ "documents"
+
+        self.temp_dir = config.TEMP_DIR
+
+        self.pandoc_available = False
+
+        
+
+        # Verify Pandoc is installed
+
+        self._verify_pandoc_installation()
+
+        logger.info("✓ DocumentProcessor initialized with Pypandoc")
+
+    
+
+    def _verify_pandoc_installation(self) -> None:
+
+        """Verify that Pandoc is installed and accessible"""
+
         try:
-            source = Path(source_path)
-            if not source.exists():
-                source = config.BASE_DIR / source.name
-                if not source.exists():
-                    raise FileNotFoundError(f"Source file not found: {source_path}")
 
-            validate_file_size(source, config.MAX_DOC_SIZE)
-            source_format = detect_file_format(source)
+            if pypandoc is None:
 
-            output_name = f"{source.stem}.{target_format}"
-            output_path = self.output_dir / output_name
+                raise ImportError("pypandoc is not installed")
 
-            if not self.api_key:
-                 raise RuntimeError("Document conversion failed: 'CLOUDCONVERT_API_KEY' is not configured on the server.")
-
-            # Run the API conversion in a blocking-safe way
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._run_api_conversion, source, output_path, target_format)
             
-            result["source_format"] = source_format
-            result["metadata"] = await self._get_document_metadata(output_path)
-            
-            log_to_history("convert_document", "success", str(source), str(output_path), metadata=result)
-            return result
+
+            version = pypandoc.get_pandoc_version()
+
+            self.pandoc_available = True
+
+            logger.info(f"✓ Pandoc version detected: {version}")
 
         except Exception as e:
-            logger.exception(f"Document conversion failed: {e}")
-            log_to_history("convert_document", "error", str(source_path), error_message=str(e))
+
+            logger.error(f"✗ Pandoc verification failed: {e}")
+
+            raise RuntimeError(
+
+                "Pandoc is required but not installed or not accessible.\n"
+
+                "Please install Pandoc:\n"
+
+                "  - Windows: choco install pandoc\n"
+
+                "  - macOS: brew install pandoc\n"
+
+                "  - Linux: sudo apt-get install pandoc\n"
+
+                f"Error details: {e}"
+
+            )
+
+    
+
+    async def convert_document(self, source_path: str, target_format: str, **kwargs) -> Dict[str, Any]:
+
+        """
+
+        Convert document from one format to another using Pandoc.
+
+        
+
+        Args:
+
+            source_path: Path to source document
+
+            target_format: Target format (e.g., 'pdf', 'docx', 'html', 'md')
+
+            **kwargs: Additional options like:
+
+                - toc: bool (add table of contents)
+
+                - number_sections: bool (number sections)
+
+                - standalone: bool (produce standalone file)
+
+                - pdf_engine: str ('pdflatex', 'xelatex', 'wkhtmltopdf')
+
+                - self_contained: bool (embed resources in HTML)
+
+                - preserve_tabs: bool (preserve tabs in conversion)
+
+        
+
+        Returns:
+
+            Dict containing:
+
+                - success: bool
+
+                - message: str (description)
+
+                - output_path: str (path to converted file)
+
+                - metadata: dict (file info)
+
+                - source_format: str
+
+                - output_format: str
+
+                - file_size: int (bytes)
+
+                - error: str (if failed)
+
+                - error_type: str (type of error)
+
+        """
+
+        try:
+
+            # Validate inputs
+
+            source = self._validate_source_file(source_path)
+
+            source_format = self._detect_format(source)
+
+            target_format = target_format.lower().strip('.')
+
+            
+
+            logger.info(f"Starting conversion: {source.name} ({source_format}) → {target_format}")
+
+            
+
+            # Validate format compatibility
+
+            self._validate_format_compatibility(source_format, target_format)
+
+            
+
+            # Generate output path
+
+            output_path = self._generate_output_path(source, target_format)
+
+            
+
+            # Perform conversion with retry logic
+
+            result = await self._retry_conversion(
+
+                source, output_path, source_format, target_format, **kwargs
+
+            )
+
+            
+
+            if not result.get('success'):
+
+                return result
+
+            
+
+            # Verify output file
+
+            if not output_path.exists():
+
+                raise RuntimeError("Conversion completed but output file not found")
+
+            
+
+            file_size = output_path.stat().st_size
+
+            if file_size == 0:
+
+                raise RuntimeError("Conversion produced an empty file")
+
+            
+
+            # Extract metadata
+
+            metadata = self._extract_metadata(output_path, target_format)
+
+            
+
+            result.update({
+
+                'metadata': metadata,
+
+                'source_format': source_format,
+
+                'output_format': target_format,
+
+                'file_size': file_size
+
+            })
+
+            
+
+            logger.info(f"✓ Successfully converted to {output_path.name} ({file_size} bytes)")
+
+            return result
+
+            
+
+        except FileNotFoundError as e:
+
+            logger.error(f"File not found: {e}")
+
             return {
-                "success": False,
-                "error": str(e),
-                "source_path": str(source_path),
-                "target_format": target_format
+
+                'success': False,
+
+                'error': f"Source file not found: {source_path}",
+
+                'error_type': 'file_not_found',
+
+                'source_path': source_path
+
             }
 
-    def _run_api_conversion(self, source_file: Path, output_file: Path, target_format: str) -> Dict[str, Any]:
+        except ValueError as e:
+
+            logger.error(f"Validation error: {e}")
+
+            return {
+
+                'success': False,
+
+                'error': str(e),
+
+                'error_type': 'validation_error',
+
+                'source_path': source_path,
+
+                'target_format': target_format
+
+            }
+
+        except RuntimeError as e:
+
+            logger.error(f"Conversion error: {e}")
+
+            return {
+
+                'success': False,
+
+                'error': str(e),
+
+                'error_type': 'pandoc_error',
+
+                'source_path': source_path,
+
+                'target_format': target_format
+
+            }
+
+        except Exception as e:
+
+            logger.exception(f"Unexpected error during conversion")
+
+            return {
+
+                'success': False,
+
+                'error': str(e),
+
+                'error_type': 'conversion_error',
+
+                'source_path': source_path,
+
+                'target_format': target_format
+
+            }
+
+    
+
+    async def _retry_conversion(self, source: Path, output_path: Path, source_format: str,
+
+                               target_format: str, **kwargs) -> Dict[str, Any]:
+
+        """Execute conversion with retry logic"""
+
+        last_error = None
+
+        
+
+        for attempt in range(self.MAX_RETRIES):
+
+            try:
+
+                loop = asyncio.get_event_loop()
+
+                result = await loop.run_in_executor(
+
+                    None,
+
+                    self._execute_pypandoc_conversion,
+
+                    source,
+
+                    output_path,
+
+                    source_format,
+
+                    target_format,
+
+                    kwargs
+
+                )
+
+                return result
+
+            except Exception as e:
+
+                last_error = e
+
+                logger.warning(f"Conversion attempt {attempt + 1}/{self.MAX_RETRIES} failed: {e}")
+
+                if attempt < self.MAX_RETRIES - 1:
+
+                    await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
+
+        
+
+        # All retries failed
+
+        raise last_error
+
+    
+
+    def _execute_pypandoc_conversion(self, source: Path, output_path: Path,
+
+                                    source_format: str, target_format: str,
+
+                                    kwargs: Dict) -> Dict[str, Any]:
+
         """
-        Synchronous helper function to run the CloudConvert job.
-        This runs in an executor to avoid blocking the async server.
+
+        Execute Pypandoc conversion synchronously.
+
+        Runs in executor to prevent blocking async code.
+
         """
-        job = cloudconvert.Job.create(payload={
-            "tasks": {
-                "import-file": {
-                    "operation": "import/upload"
-                },
-                "convert-file": {
-                    "operation": "convert",
-                    "input": "import-file",
-                    "output_format": target_format,
-                    "filename": f"{source_file.stem}.{target_format}"
-                },
-                "export-file": {
-                    "operation": "export/url",
-                    "input": "convert-file"
+
+        if not self.pandoc_available:
+
+            raise RuntimeError("Pandoc is not available")
+
+        
+
+        try:
+
+            # Get Pandoc format names
+
+            input_format = self.PANDOC_FORMAT_MAP.get(source_format, source_format)
+
+            output_format = self.PANDOC_FORMAT_MAP.get(target_format, target_format)
+
+            
+
+            # Build extra arguments for Pandoc
+
+            extra_args = self._build_pandoc_args(target_format, kwargs)
+
+            
+
+            logger.debug(
+
+                f"Pandoc execution: {input_format} → {output_format}\n"
+
+                f"  Source: {source}\n"
+
+                f"  Output: {output_path}\n"
+
+                f"  Args: {extra_args}"
+
+            )
+
+            
+
+            # Read source file as binary
+
+            with open(source, 'rb') as f:
+
+                source_content = f.read()
+
+            
+
+            # Convert using Pypandoc
+
+            output_content = pypandoc.convert_text(
+
+                source=source_content,
+
+                format=input_format,
+
+                to=output_format,
+
+                extra_args=extra_args,
+
+                outputfile=str(output_path)
+
+            )
+
+            
+
+            # Verify output file was created
+
+            if not output_path.exists():
+
+                raise RuntimeError(
+
+                    f"Pandoc failed to create output file at {output_path}\n"
+
+                    f"Pandoc output: {output_content}"
+
+                )
+
+            
+
+            return {
+
+                'success': True,
+
+                'message': f"Successfully converted {source.name} to {target_format}",
+
+                'output_path': str(output_path),
+
+                'converter': 'pypandoc (Pandoc)'
+
+            }
+
+            
+
+        except Exception as e:
+
+            logger.error(f"Pypandoc conversion error: {e}")
+
+            raise RuntimeError(f"Pandoc conversion failed: {str(e)}")
+
+    
+
+    def _build_pandoc_args(self, target_format: str, kwargs: Dict) -> List[str]:
+
+        """
+
+        Build extra arguments for Pandoc command line.
+
+        
+
+        Reference: https://pandoc.org/MANUAL.html
+
+        """
+
+        args = []
+
+        
+
+        # Standalone option (useful for HTML, LaTeX, Markdown)
+
+        if kwargs.get('standalone', True):
+
+            args.append('--standalone')
+
+        
+
+        # Table of contents
+
+        if kwargs.get('toc', False):
+
+            args.append('--toc')
+
+            # TOC depth
+
+            toc_depth = kwargs.get('toc_depth', 3)
+
+            args.extend(['--toc-depth', str(toc_depth)])
+
+        
+
+        # Number sections
+
+        if kwargs.get('number_sections', False):
+
+            args.append('--number-sections')
+
+        
+
+        # Preserve tabs (don't convert to spaces)
+
+        if kwargs.get('preserve_tabs', False):
+
+            args.append('--preserve-tabs')
+
+        
+
+        # PDF engine selection for PDF output
+
+        if target_format == 'pdf':
+
+            pdf_engine = kwargs.get('pdf_engine', 'pdflatex')
+
+            args.extend(['--pdf-engine', pdf_engine])
+
+            
+
+            # PDF engine options
+
+            if kwargs.get('pdf_engine_opt'):
+
+                args.extend(['--pdf-engine-opt', kwargs['pdf_engine_opt']])
+
+        
+
+        # Reference document (for DOCX output styling)
+
+        if kwargs.get('reference_doc'):
+
+            ref_path = Path(kwargs['reference_doc'])
+
+            if ref_path.exists():
+
+                args.extend(['--reference-doc', str(ref_path)])
+
+            else:
+
+                logger.warning(f"Reference document not found: {ref_path}")
+
+        
+
+        # Template file
+
+        if kwargs.get('template'):
+
+            template_path = Path(kwargs['template'])
+
+            if template_path.exists():
+
+                args.extend(['--template', str(template_path)])
+
+            else:
+
+                logger.warning(f"Template not found: {template_path}")
+
+        
+
+        # Metadata (key=value pairs)
+
+        if kwargs.get('metadata') and isinstance(kwargs['metadata'], dict):
+
+            for key, value in kwargs['metadata'].items():
+
+                args.extend(['-M', f'{key}={value}'])
+
+        
+
+        # Self-contained HTML (embed images, CSS, etc.)
+
+        if kwargs.get('self_contained', False) and target_format == 'html':
+
+            args.append('--self-contained')
+
+        
+
+        # CSS file for HTML output
+
+        if kwargs.get('css') and target_format == 'html':
+
+            css_path = Path(kwargs['css'])
+
+            if css_path.exists():
+
+                args.extend(['-c', str(css_path)])
+
+            else:
+
+                logger.warning(f"CSS file not found: {css_path}")
+
+        
+
+        # Code highlighting
+
+        if kwargs.get('highlight_style'):
+
+            args.extend(['--highlight-style', kwargs['highlight_style']])
+
+        
+
+        # Data directory (for templates, etc.)
+
+        if kwargs.get('data_dir'):
+
+            data_dir = Path(kwargs['data_dir'])
+
+            if data_dir.exists():
+
+                args.extend(['--data-dir', str(data_dir)])
+
+        
+
+        # Verbose output
+
+        if kwargs.get('verbose', False):
+
+            args.append('--verbose')
+
+        
+
+        # Strip empty paragraphs
+
+        if kwargs.get('strip_empty_paragraphs', False):
+
+            args.append('--strip-empty-paragraphs')
+
+        
+
+        # Slide format options
+
+        if target_format in ['pptx', 'beamer']:
+
+            if kwargs.get('slide_level'):
+
+                args.extend(['--slide-level', str(kwargs['slide_level'])])
+
+        
+
+        logger.debug(f"Pandoc arguments: {args}")
+
+        return args
+
+    
+
+    def _validate_source_file(self, source_path: str) -> Path:
+
+        """Validate source file exists and is readable"""
+
+        source = Path(source_path)
+
+        
+
+        # Try direct path first
+
+        if not source.exists():
+
+            # Try relative to base directory
+
+            source = config.BASE_DIR / source.name
+
+            if not source.exists():
+
+                raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        
+
+        # Resolve to absolute path
+
+        source = source.resolve()
+
+        
+
+        # Check file size
+
+        try:
+
+            file_size = source.stat().st_size
+
+        except OSError as e:
+
+            raise PermissionError(f"Cannot access file: {e}")
+
+        
+
+        if file_size == 0:
+
+            raise ValueError("Source file is empty")
+
+        
+
+        if file_size > config.MAX_DOC_SIZE:
+
+            size_mb = file_size / (1024 * 1024)
+
+            max_mb = config.MAX_DOC_SIZE / (1024 * 1024)
+
+            raise ValueError(f"File too large: {size_mb:.1f}MB (max: {max_mb:.0f}MB)")
+
+        
+
+        # Check readability
+
+        if not os.access(source, os.R_OK):
+
+            raise PermissionError(f"File is not readable: {source}")
+
+        
+
+        logger.debug(f"Source file validated: {source} ({file_size} bytes)")
+
+        return source
+
+    
+
+    def _detect_format(self, file_path: Path) -> str:
+
+        """Detect file format from extension and magic bytes"""
+
+        ext = file_path.suffix.lower().lstrip('.')
+
+        
+
+        # Check extension first
+
+        if ext in self.FORMAT_MIME_TYPES:
+
+            logger.debug(f"Format detected by extension: {ext}")
+
+            return ext
+
+        
+
+        # Try magic bytes detection
+
+        try:
+
+            import magic
+
+            mime_type = magic.from_file(str(file_path), mime=True)
+
+            logger.debug(f"MIME type detected: {mime_type}")
+
+            
+
+            # Map MIME type to format
+
+            mime_to_format = {
+
+                'application/pdf': 'pdf',
+
+                'application/msword': 'doc',
+
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+
+                'text/html': 'html',
+
+                'text/plain': 'txt',
+
+                'text/markdown': 'md',
+
+                'application/vnd.oasis.opendocument.text': 'odt',
+
+                'application/epub+zip': 'epub',
+
+                'application/rtf': 'rtf',
+
+            }
+
+            
+
+            for mime, fmt in mime_to_format.items():
+
+                if mime in mime_type:
+
+                    logger.debug(f"Format detected by MIME type: {fmt}")
+
+                    return fmt
+
+        except Exception as e:
+
+            logger.debug(f"Magic detection failed: {e}")
+
+        
+
+        # Fallback to extension
+
+        if ext and ext in config.DOC_FORMATS:
+
+            logger.debug(f"Format detected by extension fallback: {ext}")
+
+            return ext
+
+        
+
+        raise ValueError(f"Unable to detect file format for: {file_path}")
+
+    
+
+    def _validate_format_compatibility(self, source_format: str, target_format: str) -> None:
+
+        """Validate that conversion is supported"""
+
+        if source_format not in self.FORMAT_COMPATIBILITY:
+
+            raise ValueError(f"Unsupported source format: {source_format}")
+
+        
+
+        compatible_targets = self.FORMAT_COMPATIBILITY.get(source_format, [])
+
+        if target_format not in compatible_targets:
+
+            raise ValueError(
+
+                f"Cannot convert {source_format} to {target_format}. "
+
+                f"Supported targets for {source_format}: {', '.join(compatible_targets)}"
+
+            )
+
+    
+
+    def _generate_output_path(self, source: Path, target_format: str) -> Path:
+
+        """Generate output file path with timestamp"""
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        output_name = f"{source.stem}_{timestamp}.{target_format}"
+
+        return self.output_dir / output_name
+
+    
+
+    def _extract_metadata(self, file_path: Path, file_format: str) -> Dict[str, Any]:
+
+        """Extract file metadata"""
+
+        try:
+
+            stats = file_path.stat()
+
+        except OSError as e:
+
+            logger.warning(f"Cannot read file stats: {e}")
+
+            return {}
+
+        
+
+        metadata = {
+
+            'file_size': stats.st_size,
+
+            'created_time': datetime.fromtimestamp(stats.st_ctime).isoformat(),
+
+            'modified_time': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+
+            'format': file_format,
+
+            'mime_type': self.FORMAT_MIME_TYPES.get(file_format, 'application/octet-stream'),
+
+            'file_name': file_path.name
+
+        }
+
+        
+
+        # Extract format-specific metadata
+
+        try:
+
+            if file_format == 'pdf':
+
+                metadata.update(self._extract_pdf_metadata(file_path))
+
+            elif file_format in ['docx', 'doc']:
+
+                metadata.update(self._extract_docx_metadata(file_path))
+
+            elif file_format == 'html':
+
+                metadata.update(self._extract_html_metadata(file_path))
+
+        except Exception as e:
+
+            logger.debug(f"Format-specific metadata extraction failed: {e}")
+
+        
+
+        return metadata
+
+    
+
+    def _extract_pdf_metadata(self, file_path: Path) -> Dict[str, Any]:
+
+        """Extract PDF-specific metadata"""
+
+        try:
+
+            import PyPDF2
+
+            with open(file_path, 'rb') as f:
+
+                reader = PyPDF2.PdfReader(f)
+
+                return {
+
+                    'pages': len(reader.pages),
+
+                    'encrypted': reader.is_encrypted
+
                 }
+
+        except ImportError:
+
+            logger.debug("PyPDF2 not installed, skipping PDF metadata")
+
+            return {}
+
+        except Exception as e:
+
+            logger.debug(f"PDF metadata extraction failed: {e}")
+
+            return {}
+
+    
+
+    def _extract_docx_metadata(self, file_path: Path) -> Dict[str, Any]:
+
+        """Extract DOCX-specific metadata"""
+
+        try:
+
+            from docx import Document
+
+            doc = Document(file_path)
+
+            image_count = len([rel for rel in doc.part.rels.values() if 'image' in rel.reltype])
+
+            return {
+
+                'paragraphs': len(doc.paragraphs),
+
+                'tables': len(doc.tables),
+
+                'images': image_count
+
             }
-        })
 
-        # Upload the file
-        upload_task_id = job['tasks'][0]['id']
-        upload_task = cloudconvert.Task.find(id=upload_task_id)
-        cloudconvert.Task.upload(file_name=str(source_file), task=upload_task)
+        except ImportError:
 
-        # Wait for job to finish
-        job = cloudconvert.Job.wait(id=job['id'])
-        
-        if job.get("status") == "error":
-            raise RuntimeError(f"CloudConvert API error: {job.get('message', 'Unknown error')}")
+            logger.debug("python-docx not installed, skipping DOCX metadata")
 
-        # Get the exported file
-        export_task = [t for t in job.get("tasks", []) if t.get("name") == "export-file"][0]
-        file_data = export_task.get("result", {}).get("files", [])
-        
-        if not file_data:
-            raise RuntimeError("CloudConvert API failed: No file was returned.")
+            return {}
 
-        # Download the file
-        download_url = file_data[0]['url']
-        response = requests.get(download_url)
-        output_file.write_bytes(response.content)
+        except Exception as e:
+
+            logger.debug(f"DOCX metadata extraction failed: {e}")
+
+            return {}
+
+    
+
+    def _extract_html_metadata(self, file_path: Path) -> Dict[str, Any]:
+
+        """Extract HTML-specific metadata"""
+
+        try:
+
+            from html.parser import HTMLParser
+
+            
+
+            class MetadataParser(HTMLParser):
+
+                def __init__(self):
+
+                    super().__init__()
+
+                    self.title = None
+
+                    self.headings = 0
+
+                    self.paragraphs = 0
+
+                    self.links = 0
+
+                    self.images = 0
+
+                    self.in_title = False
+
+                
+
+                def handle_starttag(self, tag, attrs):
+
+                    if tag == 'title':
+
+                        self.in_title = True
+
+                    elif tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+
+                        self.headings += 1
+
+                    elif tag == 'p':
+
+                        self.paragraphs += 1
+
+                    elif tag == 'a':
+
+                        self.links += 1
+
+                    elif tag == 'img':
+
+                        self.images += 1
+
+                
+
+                def handle_endtag(self, tag):
+
+                    if tag == 'title':
+
+                        self.in_title = False
+
+                
+
+                def handle_data(self, data):
+
+                    if self.in_title and self.title is None:
+
+                        self.title = data.strip()
+
+            
+
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+
+                parser = MetadataParser()
+
+                parser.feed(f.read())
+
+            
+
+            return {
+
+                'title': parser.title,
+
+                'headings': parser.headings,
+
+                'paragraphs': parser.paragraphs,
+
+                'links': parser.links,
+
+                'images': parser.images
+
+            }
+
+        except Exception as e:
+
+            logger.debug(f"HTML metadata extraction failed: {e}")
+
+            return {}
+
+    
+
+    def get_supported_formats(self) -> Dict[str, Any]:
+
+        """Return supported formats and compatibility information"""
 
         return {
-            "success": True,
-            "message": f"Converted {source_file.name} to {target_format} using CloudConvert",
-            "output_path": str(output_file),
-            "target_format": target_format,
-            "file_size": output_file.stat().st_size
+
+            'success': True,
+
+            'supported_formats': list(self.FORMAT_MIME_TYPES.keys()),
+
+            'compatibility_matrix': self.FORMAT_COMPATIBILITY,
+
+            'max_file_size_mb': int(config.MAX_DOC_SIZE / (1024 * 1024)),
+
+            'converter': 'pypandoc (Pandoc)',
+
+            'system_requirement': 'Pandoc system package',
+
+            'pandoc_available': self.pandoc_available
+
         }
 
-    async def _get_document_metadata(self, filepath: Path) -> Dict[str, Any]:
-        """Extract document metadata (remains the same)"""
-        stats = filepath.stat()
-        return {
-            "file_size": stats.st_size,
-            "created": datetime.fromtimestamp(stats.st_ctime).isoformat(),
-            "modified": datetime.fromtimestamp(stats.st_mtime).isoformat(),
-            "format": detect_file_format(filepath)
-        }
+    
+
+    def get_pandoc_info(self) -> Dict[str, Any]:
+
+        """Get detailed information about installed Pandoc"""
+
+        try:
+
+            if not self.pandoc_available:
+
+                return {
+
+                    'status': 'not_available',
+
+                    'error': 'Pandoc is not installed or not accessible'
+
+                }
+
+            
+
+            version = pypandoc.get_pandoc_version()
+
+            
+
+            # Get list of supported input formats
+
+            try:
+
+                input_result = subprocess.run(
+
+                    ['pandoc', '--list-input-formats'],
+
+                    capture_output=True,
+
+                    text=True,
+
+                    timeout=5
+
+                )
+
+                input_formats = input_result.stdout.strip().split() if input_result.returncode == 0 else []
+
+            except Exception as e:
+
+                logger.warning(f"Could not get input formats: {e}")
+
+                input_formats = []
+
+            
+
+            # Get list of supported output formats
+
+            try:
+
+                output_result = subprocess.run(
+
+                    ['pandoc', '--list-output-formats'],
+
+                    capture_output=True,
+
+                    text=True,
+
+                    timeout=5
+
+                )
+
+                output_formats = output_result.stdout.strip().split() if output_result.returncode == 0 else []
+
+            except Exception as e:
+
+                logger.warning(f"Could not get output formats: {e}")
+
+                output_formats = []
+
+            
+
+            return {
+
+                'status': 'installed',
+
+                'version': str(version),
+
+                'supported_input_formats': input_formats,
+
+                'supported_output_formats': output_formats,
+
+                'total_input_formats': len(input_formats),
+
+                'total_output_formats': len(output_formats)
+
+            }
+
+        except Exception as e:
+
+            logger.error(f"Failed to get Pandoc info: {e}")
+
+            return {
+
+                'status': 'error',
+
+                'error': str(e)
+
+            }
+# --- END of DocumentProcessor ---
+
 
 # --- Image Processing Service ---
 class ImageProcessor:
@@ -362,34 +1556,14 @@ class ImageProcessor:
             output_name = f"{source.stem}_processed.{output_format}"
             output_path = self.output_dir / output_name
             
-            # Process image
-            with Image.open(source) as img:
-                processed_img = img.copy()
-                
-                # Apply operations
-                for operation in operations:
-                    if operation == "resize" and (width or height):
-                        processed_img = self._resize_image(processed_img, width, height)
-                    elif operation == "enhance":
-                        processed_img = self._enhance_image(processed_img)
-                    elif operation == "convert":
-                        pass  # Handled in save
-                
-                # Convert mode if necessary
-                if processed_img.mode in ('RGBA', 'LA', 'P') and output_format.lower() == 'jpeg':
-                    background = Image.new('RGB', processed_img.size, (255, 255, 255))
-                    if processed_img.mode in ('RGBA', 'LA'):
-                        background.paste(processed_img, mask=processed_img.split()[-1])
-                    else:
-                        background.paste(processed_img)
-                    processed_img = background
-                
-                # Save processed image
-                save_kwargs = {'format': output_format.upper()}
-                if output_format.lower() in ['jpeg', 'webp']:
-                    save_kwargs.update({'quality': quality, 'optimize': True})
-                
-                processed_img.save(output_path, **save_kwargs)
+            # Process image in an executor to be non-blocking
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, 
+                self._run_image_processing, 
+                source, output_path, operations, 
+                width, height, output_format, quality
+            )
             
             metadata = await self._get_image_metadata(output_path)
             
@@ -414,6 +1588,36 @@ class ImageProcessor:
                 "operations": operations
             }
     
+    def _run_image_processing(self, source: Path, output_path: Path, operations: List[str], width: Optional[int], height: Optional[int], output_format: str, quality: int):
+        """Synchronous helper for image processing."""
+        with Image.open(source) as img:
+            processed_img = img.copy()
+            
+            # Apply operations
+            for operation in operations:
+                if operation == "resize" and (width or height):
+                    processed_img = self._resize_image(processed_img, width, height)
+                elif operation == "enhance":
+                    processed_img = self._enhance_image(processed_img)
+                elif operation == "convert":
+                    pass  # Handled in save
+            
+            # Convert mode if necessary
+            if processed_img.mode in ('RGBA', 'LA', 'P') and output_format.lower() == 'jpeg':
+                background = Image.new('RGB', processed_img.size, (255, 255, 255))
+                if processed_img.mode in ('RGBA', 'LA'):
+                    background.paste(processed_img, mask=processed_img.split()[-1])
+                else:
+                    background.paste(processed_img)
+                processed_img = background
+            
+            # Save processed image
+            save_kwargs = {'format': output_format.upper()}
+            if output_format.lower() in ['jpeg', 'webp']:
+                save_kwargs.update({'quality': quality, 'optimize': True})
+            
+            processed_img.save(output_path, **save_kwargs)
+
     def _resize_image(self, img: Image.Image, width: Optional[int], height: Optional[int]) -> Image.Image:
         """Resize image maintaining aspect ratio"""
         if not width and not height:
@@ -443,16 +1647,24 @@ class ImageProcessor:
     async def _get_image_metadata(self, filepath: Path) -> Dict[str, Any]:
         """Extract image metadata"""
         try:
-            with Image.open(filepath) as img:
-                stats = filepath.stat()
-                return {
-                    "width": img.width,
-                    "height": img.height,
-                    "format": img.format,
-                    "mode": img.mode,
-                    "file_size": stats.st_size,
-                    "has_exif": hasattr(img, '_getexif') and img._getexif() is not None
-                }
+            # Run PIL in executor to be safe
+            loop = asyncio.get_event_loop()
+            stats = filepath.stat()
+            
+            def get_pil_meta():
+                with Image.open(filepath) as img:
+                    return {
+                        "width": img.width,
+                        "height": img.height,
+                        "format": img.format,
+                        "mode": img.mode,
+                        "has_exif": hasattr(img, '_getexif') and img._getexif() is not None
+                    }
+            
+            pil_meta = await loop.run_in_executor(None, get_pil_meta)
+            pil_meta["file_size"] = stats.st_size
+            return pil_meta
+            
         except Exception:
             stats = filepath.stat()
             return {"file_size": stats.st_size, "format": "unknown"}
@@ -514,7 +1726,9 @@ class EmailProcessor:
                     raise FileNotFoundError(f"Email archive not found: {archive_path}")
 
             validate_file_size(archive, config.MAX_EMAIL_SIZE)
-            emails = await self._parse_email_archive(archive)
+            
+            loop = asyncio.get_event_loop()
+            emails = await loop.run_in_executor(None, self._parse_email_archive_sync, archive)
             
             if not emails:
                 raise ValueError("No emails found in archive to summarize.")
@@ -568,7 +1782,9 @@ class EmailProcessor:
                     raise FileNotFoundError(f"Email archive not found: {archive_path}")
             
             validate_file_size(archive, config.MAX_EMAIL_SIZE)
-            emails = await self._parse_email_archive(archive)
+            
+            loop = asyncio.get_event_loop()
+            emails = await loop.run_in_executor(None, self._parse_email_archive_sync, archive)
             
             query_lower = query.lower()
             matching_emails = []
@@ -612,7 +1828,8 @@ class EmailProcessor:
                 if not archive.exists():
                     raise FileNotFoundError(f"Email archive not found: {archive_path}")
 
-            emails = await self._parse_email_archive(archive)
+            loop = asyncio.get_event_loop()
+            emails = await loop.run_in_executor(None, self._parse_email_archive_sync, archive)
             
             if not emails:
                 raise ValueError("No emails found in archive")
@@ -656,8 +1873,8 @@ class EmailProcessor:
                 "archive_path": archive_path
             }
     
-    async def _parse_email_archive(self, archive_path: Path) -> List[Dict[str, Any]]:
-        """Parse email archive file"""
+    def _parse_email_archive_sync(self, archive_path: Path) -> List[Dict[str, Any]]:
+        """Synchronous helper to parse email archive file"""
         emails = []
         try:
             if archive_path.suffix.lower() == '.mbox':
@@ -725,7 +1942,10 @@ class NewsProcessor:
     async def add_news_source(self, feed_url: str, category: str = "general", **kwargs) -> Dict[str, Any]:
         """Add RSS news source to the database"""
         try:
-            feed = feedparser.parse(feed_url)
+            # Run blocking feedparser in executor
+            loop = asyncio.get_event_loop()
+            feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
+
             if feed.bozo:
                 raise ValueError(f"Invalid RSS feed: {feed_url}")
             
@@ -776,6 +1996,7 @@ class NewsProcessor:
         
         # --- NEW: Get optional keyword from arguments ---
         keyword_filter = kwargs.get("category_keyword", "").lower()
+        loop = asyncio.get_event_loop()
 
         try:
             with get_db_connection() as conn:
@@ -784,7 +2005,9 @@ class NewsProcessor:
             
                 for source in sources:
                     try:
-                        feed = feedparser.parse(source["url"])
+                        # Run blocking feedparser in executor
+                        feed = await loop.run_in_executor(None, feedparser.parse, source["url"])
+                        
                         for entry in feed.entries[:20]:
                             article = {
                                 "title": entry.get("title", ""),
